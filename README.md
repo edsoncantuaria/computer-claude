@@ -48,8 +48,10 @@ Ask Claude for what you want done on the desktop, for example:
 | Tool | What it does |
 | --- | --- |
 | `computer_list` | Apps, windows, screens, or backend status |
-| `computer_observe` | Screenshot plus a snapshot of the clickable elements of an app, window, or screen |
-| `computer_inspect` | Element tree of a snapshot, paged |
+| `computer_observe` | Screenshot, snapshot ID, and the element list of an app, window, or screen |
+| `computer_inspect` | More of a snapshot's element tree, paged |
+| `computer_wait` | Wait until text appears in, or disappears from, an app, window, or the screen |
+| `computer_zoom` | A region of an observed screenshot at full resolution, for small text |
 | `computer_click` | Click an element, a text match, or screenshot coordinates |
 | `computer_type` | Type text into a field |
 | `computer_press`, `computer_hotkey` | Key presses and shortcuts |
@@ -58,6 +60,10 @@ Ask Claude for what you want done on the desktop, for example:
 | `computer_clipboard` | Read and write the clipboard |
 | `computer_app` | Launch, switch to, quit, hide apps |
 | `computer_window`, `computer_window_place` | Focus, move, resize, close windows; send them to another screen or workspace |
+
+Tools that change the desktop (`computer_click`, `computer_type`, `computer_press`, `computer_hotkey`, `computer_scroll`, `computer_drag`, `computer_app`, `computer_window`) accept `observe_after: true`, which returns the new state in the same call.
+
+The plugin also ships a skill, `using-the-desktop`, that teaches Claude how to use these tools: observe a window, act on elements instead of coordinates, confirm the effect, and what to ask you first.
 
 ## How it works
 
@@ -76,14 +82,25 @@ The extension exists because GNOME Shell denies window introspection and screens
 - **Typing is checked.** When the field can be read, text that did not arrive fails with `INPUT_NOT_DELIVERED`.
 - **Typing follows your keyboard layout.** Characters with no key go through the input method or the clipboard.
 - **`cmd` means Ctrl.** Use `super` for the Super key.
-- **Screenshots are in logical pixels**, so screenshot coordinates equal desktop coordinates on HiDPI displays.
+- **Screenshots are at most 1568 px on the long edge.** Larger captures are downscaled, and coordinates Claude reads from them are mapped back to the desktop, so clicks land where they were aimed on any display size. `save_path` keeps the full-resolution PNG.
+- **Shortcuts that end the session are refused.** Ctrl+Alt with a function key, Delete, or Backspace fails with `BLOCKED_SHORTCUT`.
 - **Element trees depend on the app.** Screenshots, coordinates, typing, and window actions work on every window. GTK, Qt, and X11 toolkits expose elements by default; Chromium, Electron, Firefox, QtWebEngine, and Java apps need the switch that setup enables.
 
 ## Trust boundary
 
 Any process on your session bus can call the extension's service, which means it can read the screen and inject input. That is the same trust domain as the desktop session itself; sandboxed (Flatpak) apps cannot reach it unless granted session-bus access. Screenshots are only written inside your runtime directory.
 
-Claude acts on your real desktop with your permissions. Claude Code asks before each tool call unless you allow the tools; keep it that way for anything you would not hand to someone sitting at your keyboard.
+Claude acts on your real desktop with your permissions. Claude Code asks before each tool call unless you allow the tools; keep it that way for anything you would not hand to someone sitting at your keyboard. To skip the prompt only for tools that look and never act, add this to `permissions.allow` in your Claude Code settings:
+
+```json
+[
+  "mcp__plugin_computer-claude_computer__computer_list",
+  "mcp__plugin_computer-claude_computer__computer_observe",
+  "mcp__plugin_computer-claude_computer__computer_inspect",
+  "mcp__plugin_computer-claude_computer__computer_wait",
+  "mcp__plugin_computer-claude_computer__computer_zoom"
+]
+```
 
 ## Development
 
@@ -99,6 +116,8 @@ Try a checkout without installing it: `claude --plugin-dir .`
 ## Credits
 
 The desktop backend comes from [Shellby MCP](https://github.com/Serbyte-Development/shellby-mcp) (MIT), where it serves ChatGPT Web. Computer Claude packages it as a standalone Claude Code plugin with its own extension and bus name, so the two can be installed side by side.
+
+Several ideas were learned from other projects in this space, without taking their code: observing after an action and capped screenshots from [computer-use-linux](https://github.com/agent-sh/computer-use-linux), waiting and refused session-ending shortcuts from [Deskwright](https://github.com/tristanmuzzu/deskwright), and wait tools from [gnome-ui-mcp](https://github.com/asattelmaier/gnome-ui-mcp).
 
 ## License
 

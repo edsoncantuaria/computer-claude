@@ -1,7 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { type DesktopClient, DesktopError, type DesktopResult } from "./desktop-client.js"
-import { asRecord } from "./utils.js"
 
 export const appInput = z.string().min(1).describe("App name, bundle or desktop ID, or PID:12345.")
 export const snapshotInput = z
@@ -43,11 +42,8 @@ export function commandResult(result: DesktopResult, fallbackSummary: string): C
     typeof result.summary === "string"
       ? result.summary
       : (result.messages?.find((message) => message.trim()) ?? fallbackSummary)
-  const structuredContent = asStructuredContent(result.data)
-  return {
-    content: [{ type: "text", text: summary }],
-    ...(structuredContent ? { structuredContent } : {}),
-  }
+  // Text only: a client that prefers structuredContent would hide the summary from the model.
+  return { content: [{ type: "text", text: summary }] }
 }
 
 export function desktopToolError(error: unknown): CallToolResult {
@@ -71,9 +67,4 @@ export function desktopToolError(error: unknown): CallToolResult {
     ],
     isError: true,
   }
-}
-
-function asStructuredContent(value: unknown): Record<string, unknown> | null {
-  if (value === undefined) return null
-  return asRecord(value) ?? { value }
 }

@@ -82,9 +82,11 @@ KEYSYMS = {
     "caps_lock": 0xFFE5, "minus": 0x002D, "plus": 0x002B, "equal": 0x003D,
     "comma": 0x002C, "period": 0x002E, "slash": 0x002F, "backslash": 0x005C,
     "semicolon": 0x003B, "underscore": 0x005F,
+    **{f"f{number}": 0xFFBD + number for number in range(1, 13)},
 }
 KEYSYMS.update({f"f{index}": 0xFFBD + index for index in range(1, 13)})
 
+SESSION_ENDING_KEYS = {0xFFFF, 0xFF08, *range(0xFFBE, 0xFFCA)}
 INTERACTIVE_ROLES = {
     Atspi.Role.PUSH_BUTTON, Atspi.Role.TOGGLE_BUTTON, Atspi.Role.CHECK_BOX,
     Atspi.Role.RADIO_BUTTON, Atspi.Role.MENU, Atspi.Role.MENU_ITEM,
@@ -581,7 +583,7 @@ def collect_elements(window, max_depth, max_elements, max_children, deadline=Non
     elements, lines = [], []
     seen, truncated = 0, False
 
-    def visit(accessible, depth, indent, path):
+    def visit(accessible, depth, indent, path, parent_label=""):
         nonlocal seen, truncated
         if len(elements) >= max_elements or time.monotonic() > deadline:
             truncated = True
@@ -602,7 +604,9 @@ def collect_elements(window, max_depth, max_elements, max_children, deadline=Non
         extents = extents_of(accessible)
         interactive = role in INTERACTIVE_ROLES
         visible = extents is not None and extents[2] > 0 and extents[3] > 0
-        if visible and (interactive or label):
+        # A caption that only repeats its control's label adds nothing the model can act on.
+        echo = not interactive and bool(label) and label in parent_label
+        if visible and (interactive or label) and not echo:
             element = {
                 "id": f"E{first_id + seen}",
                 "window_id": window["id"],
@@ -636,7 +640,7 @@ def collect_elements(window, max_depth, max_elements, max_children, deadline=Non
             except GLib.Error:
                 continue
             if child is not None:
-                visit(child, depth + 1, indent, [*path, index])
+                visit(child, depth + 1, indent, [*path, index], label or parent_label)
 
     visit(frame, 0, 0, [])
     return elements, lines, truncated
@@ -1098,7 +1102,7 @@ def command_see(desktop, positional, options):
                 annotated = path.removesuffix(".png") + "-annotated.png"
                 annotate(path, annotated, elements)
                 data["screenshot_annotated"] = annotated
-        if tree:
+        if tree or lines:
             data["text"] = "\n".join(lines) or "No accessible elements were exposed on this screen."
         return data, f"Observed screen {screen_index}."
 
@@ -1183,7 +1187,7 @@ def observe_window(desktop, window, options, snapshot_id, tree, capture, path):
             data["screenshot_annotated"] = annotated
     if truncated:
         data["truncated"] = True
-    if tree:
+    if tree or lines:
         data["text"] = "\n".join(lines) or (
             "No accessible elements were exposed by this window. Use coordinates from computer_observe instead."
         )
@@ -1394,6 +1398,9 @@ def keysyms_for_token(token):
             keys.append(ord(name))
         else:
             raise Fail("INVALID_KEY", f"Unknown key {part!r}.")
+    # Ctrl+Alt with a function key switches to a console, and with Delete or Backspace ends the session.
+    if 0xFFE3 in keys and 0xFFE9 in keys and any(key in SESSION_ENDING_KEYS for key in keys):
+        raise Fail("BLOCKED_SHORTCUT", f"{token} would leave or end the desktop session; ask the user to press it.")
     return keys
 
 
@@ -1769,22 +1776,44 @@ JPEG_QUALITIES = (85, 65, 55, 45, 35)
 
 
 def command_jpeg(positional):
-    """Re-encode a capture as the largest JPEG that fits the byte budget."""
+    """Re-encode a capture as a JPEG that fits the byte budget, optionally cropped and downscaled.
+
+    Usage: jpeg <source> <destination> <max-bytes> [max-edge] [x,y,width,height]
+    """
     try:
         source, destination, budget = positional[0], positional[1], int(positional[2])
+        max_edge = int(positional[3]) if len(positional) > 3 else 0
+        crop = [int(float(part)) for part in positional[4].split(",")] if len(positional) > 4 else None
+        if crop is not None and len(crop) != 4:
+            raise ValueError
     except (IndexError, ValueError):
-        raise Fail("INVALID_ARGUMENTS", "Usage: jpeg <source> <destination> <max-bytes>.") from None
+        raise Fail("INVALID_ARGUMENTS", "Usage: jpeg <source> <destination> <max-bytes> [max-edge] [x,y,width,height].") from None
     pixbuf = GdkPixbuf.Pixbuf.new_from_file(source)
+    if crop is not None:
+        x = min(max(crop[0], 0), pixbuf.get_width() - 1)
+        y = min(max(crop[1], 0), pixbuf.get_height() - 1)
+        width = min(crop[2], pixbuf.get_width() - x)
+        height = min(crop[3], pixbuf.get_height() - y)
+        if width <= 0 or height <= 0:
+            raise Fail("INVALID_ARGUMENTS", "The region is empty.")
+        pixbuf = pixbuf.new_subpixbuf(x, y, width, height)
+    width, height = pixbuf.get_width(), pixbuf.get_height()
     if pixbuf.get_has_alpha():
-        width, height = pixbuf.get_width(), pixbuf.get_height()
         opaque = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, width, height)
         opaque.fill(0xFFFFFFFF)
         pixbuf.composite(opaque, 0, 0, width, height, 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
         pixbuf = opaque
+    scale = 1.0
+    if max_edge and max(width, height) > max_edge:
+        scale = max_edge / max(width, height)
+        pixbuf = pixbuf.scale_simple(
+            max(round(width * scale), 1), max(round(height * scale), 1), GdkPixbuf.InterpType.HYPER
+        )
     for quality in JPEG_QUALITIES:
         pixbuf.savev(destination, "jpeg", ["quality"], [str(quality)])
         if os.path.getsize(destination) <= budget:
-            return {"path": destination, "width": pixbuf.get_width(), "height": pixbuf.get_height()}, "Encoded."
+            data = {"path": destination, "width": pixbuf.get_width(), "height": pixbuf.get_height(), "scale": scale}
+            return data, "Encoded."
     raise Fail("IMAGE_TOO_LARGE", f"The screenshot does not fit in {budget} bytes.")
 
 

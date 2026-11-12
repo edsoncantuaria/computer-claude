@@ -11,6 +11,8 @@ import { asRecord, finiteNumber as numberValue } from "./utils.js"
 const execFileAsync = promisify(execFile)
 /** Raw JPEG budget that keeps the base64 image within a 4 MB tool result. */
 const MAX_IMAGE_BYTES = 2_900_000
+/** Longest screenshot edge. Larger images are downscaled by the model API, which would skew coordinates. */
+const MAX_IMAGE_EDGE = 1568
 const PID_APP_RE = /^PID:\d+$/u
 
 interface DesktopEnvelope {
@@ -49,6 +51,15 @@ export interface DesktopSnapshotTarget {
     width: number
     height: number
   }
+  /** Screenshot pixels per desktop pixel: the image the model saw is this much smaller. */
+  imageScale?: number
+}
+
+export interface DesktopImageRegion {
+  x: number
+  y: number
+  width: number
+  height: number
 }
 
 export type DesktopObservationTarget =
@@ -121,7 +132,7 @@ export class DesktopClient {
   constructor(options: DesktopClientOptions = {}) {
     this.executable = options.executable ?? defaultExecutable()
     this.baseArgs = options.baseArgs ?? []
-    this.env = options.env ?? process.env
+    this.env = options.env ?? sessionEnvironment()
     this.timeoutMs = options.timeoutMs ?? 30_000
     this.maxOutputBytes = options.maxOutputBytes ?? 4 * 1024 * 1024
   }
@@ -192,9 +203,14 @@ export class DesktopClient {
     throw new DesktopError("EXACT_WINDOW_REQUIRED", message)
   }
 
-  resolveSnapshotCoordinates(snapshotId: string, x: number, y: number): DesktopResolvedCoordinates {
+  resolveSnapshotCoordinates(
+    snapshotId: string,
+    imageX: number,
+    imageY: number
+  ): DesktopResolvedCoordinates {
     const target = this.requireSnapshotTarget(snapshotId)
     const exactWindow = exactWindowTarget(target)
+    const { x, y } = this.toDesktopPixels(snapshotId, imageX, imageY)
     const needsGlobalCoordinates =
       isScreenSnapshotTarget(target) || (target.windowId === undefined && !target.app)
 
@@ -220,6 +236,12 @@ export class DesktopClient {
       targetArgs: snapshotActionTargetArgs(target),
       ...(exactWindow ? { exactWindowTarget: exactWindow } : {}),
     }
+  }
+
+  /** Convert a point on the screenshot the model saw into the desktop pixels the helper expects. */
+  toDesktopPixels(snapshotId: string, x: number, y: number): { x: number; y: number } {
+    const scale = this.snapshots.get(snapshotId)?.imageScale ?? 1
+    return { x: Math.round(x / scale), y: Math.round(y / scale) }
   }
 
   rememberSnapshotTarget(snapshotId: string, target: DesktopSnapshotTarget): void {
@@ -280,11 +302,12 @@ export class DesktopClient {
           await mkdir(dirname(request.savePath), { recursive: true })
           await copyFile(imagePath, request.savePath)
         }
-        const jpegPath = join(directory, "capture.jpg")
-        await this.runNow(["jpeg", imagePath, jpegPath, String(MAX_IMAGE_BYTES)], signal)
+        const { imageData, scale } = await this.encodeImage(imagePath, directory, signal)
+        if (snapshotId && target)
+          this.rememberSnapshot(snapshotId, { ...target, imageScale: scale })
         return {
           ...result,
-          imageData: (await readFile(jpegPath)).toString("base64"),
+          imageData,
           mimeType: "image/jpeg",
           ...(target ? { target } : {}),
         }
@@ -299,6 +322,83 @@ export class DesktopClient {
       }
     } finally {
       await rm(directory, { recursive: true, force: true })
+    }
+  }
+
+  /** Read a target's elements without a screenshot, as a snapshot that later actions can use. */
+  readElements(target: DesktopObservationTarget, signal?: AbortSignal): Promise<DesktopResult> {
+    return this.enqueue(async (requestSignal) => {
+      const result = await this.runNow(
+        [
+          "see",
+          ...observationRequestArgs({ target, annotate: false }),
+          "--tree",
+          "--no-screenshot",
+          "--depth",
+          "40",
+          "--max-elements",
+          "300",
+          "--max-children",
+          "200",
+        ],
+        requestSignal
+      )
+      const data = asRecord(result.data)
+      const snapshotId = stringValue(data?.snapshot_id)
+      const resolved = await this.resolveObservationTarget(target, data, requestSignal)
+      if (snapshotId && resolved) this.rememberSnapshot(snapshotId, resolved)
+      return result
+    }, signal)
+  }
+
+  /** Re-capture a snapshot's target and return one region of it at full resolution, for reading. */
+  zoom(
+    snapshotId: string,
+    region: DesktopImageRegion,
+    signal?: AbortSignal
+  ): Promise<{ imageData: string; mimeType: "image/jpeg" }> {
+    return this.enqueue(async (requestSignal) => {
+      const target = this.requireSnapshotTarget(snapshotId)
+      const scale = target.imageScale ?? 1
+      const directory = await mkdtemp(join(tmpdir(), "computer-claude-"))
+      const capturePath = join(directory, "capture.png")
+      try {
+        await this.runNow(
+          ["see", ...snapshotObservationTargetArgs(target), "--no-elements", "--path", capturePath],
+          requestSignal
+        )
+        const crop = [region.x, region.y, region.width, region.height]
+          .map((value) => Math.round(value / scale))
+          .join(",")
+        const { imageData } = await this.encodeImage(capturePath, directory, requestSignal, crop)
+        return { imageData, mimeType: "image/jpeg" as const }
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+      }
+    }, signal)
+  }
+
+  private async encodeImage(
+    imagePath: string,
+    directory: string,
+    signal: AbortSignal,
+    crop?: string
+  ): Promise<{ imageData: string; scale: number }> {
+    const jpegPath = join(directory, "encoded.jpg")
+    const encoded = await this.runNow(
+      [
+        "jpeg",
+        imagePath,
+        jpegPath,
+        String(MAX_IMAGE_BYTES),
+        String(MAX_IMAGE_EDGE),
+        ...(crop ? [crop] : []),
+      ],
+      signal
+    )
+    return {
+      imageData: (await readFile(jpegPath)).toString("base64"),
+      scale: numberValue(asRecord(encoded.data)?.scale) ?? 1,
     }
   }
 
@@ -651,4 +751,14 @@ function stringValue(value: unknown): string | undefined {
 /** The helper ships next to the bundled server (`dist/`) and next to the sources (`src/`). */
 function defaultExecutable(): string {
   return fileURLToPath(new URL("../desktop/computer-claude-desktop", import.meta.url))
+}
+
+/** Claude Code may start the server without the desktop session's variables; the session bus has a fixed address. */
+function sessionEnvironment(): NodeJS.ProcessEnv {
+  const runtimeDir = process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`
+  return {
+    ...process.env,
+    XDG_RUNTIME_DIR: runtimeDir,
+    DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS ?? `unix:path=${runtimeDir}/bus`,
+  }
 }

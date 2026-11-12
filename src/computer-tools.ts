@@ -4,11 +4,16 @@ import {
   type DesktopClient,
   DesktopError,
   type DesktopExactWindowTarget,
-  type DesktopObservation,
   type DesktopObservationTarget,
   type DesktopResult,
 } from "./desktop-client.js"
 import { registerGnomeTools } from "./gnome-tools.js"
+import {
+  type ActionInput,
+  observationResult,
+  registerObservationTools,
+  withObservation,
+} from "./observation.js"
 import type { ToolRegistrar } from "./registrar.js"
 import {
   addTargetArgs,
@@ -20,15 +25,45 @@ import {
   targetFields,
   windowIdInput,
 } from "./tool-shared.js"
-import { asRecord, booleanValue, finiteNumber as numberValue } from "./utils.js"
+import { asRecord } from "./utils.js"
 
 const KEY_TOKEN_PATTERN = /^[A-Za-z0-9_]+$/u
+
+const observeAfterField = {
+  observe_after: z
+    .boolean()
+    .optional()
+    .describe(
+      "Also return a fresh observation of the target (screenshot, snapshot_id, elements) after acting."
+    ),
+}
+
+interface ToolContext {
+  mcpReq: { signal: AbortSignal }
+}
 
 // biome-ignore lint/complexity/noExcessiveLinesPerFunction: Registration stays together so shared schemas and tool contracts remain locally auditable.
 export function registerComputerUseTools(
   registerTool: ToolRegistrar,
   desktop: DesktopClient
 ): void {
+  /** Registers a tool that changes the desktop, adding the optional observation of its effect. */
+  const registerAction = ((
+    name: string,
+    config: unknown,
+    handler: (input: ActionInput, ctx: ToolContext) => Promise<CallToolResult>
+  ) =>
+    Reflect.apply(registerTool, undefined, [
+      name,
+      config,
+      async (input: ActionInput, ctx: ToolContext) => {
+        const result = await handler(input, ctx)
+        if (!input.observe_after || result.isError) return result
+        return withObservation(desktop, result, input, ctx.mcpReq.signal)
+      },
+      // biome-ignore lint/nursery/noUnsafeTypeAssertion: The wrapper keeps the registrar's signature; only the handler is decorated.
+    ])) as ToolRegistrar
+
   const listSchema = z.object({
     kind: z.enum(["apps", "windows", "screens", "permissions"]).default("apps"),
     app: appInput.optional().describe("App whose windows to list."),
@@ -132,6 +167,8 @@ export function registerComputerUseTools(
     }
   )
 
+  registerObservationTools(registerTool, desktop)
+
   registerTool(
     "computer_inspect",
     {
@@ -139,9 +176,9 @@ export function registerComputerUseTools(
         "Inspect an observed snapshot for accessible elements. Use the returned snapshot_id with its element IDs.",
       inputSchema: z.object({
         snapshot_id: snapshotInput,
-        max_depth: z.number().int().min(1).max(20).default(8),
-        max_elements: z.number().int().min(1).max(500).default(100),
-        max_children: z.number().int().min(1).max(100).default(25),
+        max_depth: z.number().int().min(1).max(60).default(40),
+        max_elements: z.number().int().min(1).max(500).default(150),
+        max_children: z.number().int().min(1).max(500).default(200),
         offset: z
           .number()
           .int()
@@ -177,6 +214,7 @@ export function registerComputerUseTools(
 
   const clickSchema = z
     .object({
+      ...observeAfterField,
       snapshot_id: snapshotInput,
       element_id: z.string().min(1).optional(),
       query: z.string().min(1).optional().describe("Visible label or text."),
@@ -228,7 +266,7 @@ export function registerComputerUseTools(
       }
     })
 
-  registerTool(
+  registerAction(
     "computer_click",
     {
       description: "Click an element, visible text, or coordinates from a snapshot.",
@@ -300,6 +338,7 @@ export function registerComputerUseTools(
 
   const typeSchema = z
     .object({
+      ...observeAfterField,
       ...targetFields,
       text: z.string().min(1),
       clear: z.boolean().optional(),
@@ -322,7 +361,7 @@ export function registerComputerUseTools(
       }
     })
 
-  registerTool(
+  registerAction(
     "computer_type",
     {
       description: "Type text into an app, window, or snapshot.",
@@ -351,6 +390,7 @@ export function registerComputerUseTools(
 
   const pressSchema = z
     .object({
+      ...observeAfterField,
       ...targetFields,
       keys: z.array(keyToken).min(1).max(16),
       count: z.number().int().min(1).max(100).optional(),
@@ -366,7 +406,7 @@ export function registerComputerUseTools(
       }
     })
 
-  registerTool(
+  registerAction(
     "computer_press",
     {
       description: "Press keys sequentially. Use computer_hotkey for simultaneous shortcuts.",
@@ -389,6 +429,7 @@ export function registerComputerUseTools(
 
   const hotkeySchema = z
     .object({
+      ...observeAfterField,
       ...targetFields,
       keys: z.array(keyToken).min(1).max(8),
       foreground: z.boolean().optional(),
@@ -403,7 +444,7 @@ export function registerComputerUseTools(
       }
     })
 
-  registerTool(
+  registerAction(
     "computer_hotkey",
     {
       description: "Press a keyboard shortcut. Use computer_press for sequential keys.",
@@ -425,6 +466,7 @@ export function registerComputerUseTools(
 
   const scrollSchema = z
     .object({
+      ...observeAfterField,
       ...targetFields,
       direction: z.enum(["up", "down", "left", "right"]),
       amount: z.number().int().min(1).max(100).optional(),
@@ -491,7 +533,8 @@ export function registerComputerUseTools(
         input.snapshot_id,
         "Background coordinate scrolling requires an exact window observation."
       )
-      args.push("--at", `${input.x},${input.y}`, "--window-id", String(target.windowId))
+      const point = desktop.toDesktopPixels(input.snapshot_id, input.x ?? 0, input.y ?? 0)
+      args.push("--at", `${point.x},${point.y}`, "--window-id", String(target.windowId))
       if (input.smooth) args.push("--smooth")
       const result = await desktop.runWithFreshLocalWindowSnapshot(target, args, signal)
       return commandResult(result, "Scroll completed.")
@@ -500,7 +543,7 @@ export function registerComputerUseTools(
     }
   }
 
-  registerTool(
+  registerAction(
     "computer_scroll",
     {
       description:
@@ -532,6 +575,7 @@ export function registerComputerUseTools(
   const dragPoint = z.object({ x: z.number(), y: z.number() }).strict()
   const dragSchema = z
     .object({
+      ...observeAfterField,
       snapshot_id: snapshotInput,
       from: dragPoint,
       to: dragPoint,
@@ -540,7 +584,7 @@ export function registerComputerUseTools(
     })
     .strict()
 
-  registerTool(
+  registerAction(
     "computer_drag",
     {
       description:
@@ -554,13 +598,15 @@ export function registerComputerUseTools(
       },
     },
     async (input, ctx) => {
+      const from = desktop.toDesktopPixels(input.snapshot_id, input.from.x, input.from.y)
+      const to = desktop.toDesktopPixels(input.snapshot_id, input.to.x, input.to.y)
       if (desktop.getSnapshotTarget(input.snapshot_id)?.kind?.includes("screen")) {
         const args = [
           "drag",
           "--from",
-          `${input.from.x},${input.from.y}`,
+          `${from.x},${from.y}`,
           "--to",
-          `${input.to.x},${input.to.y}`,
+          `${to.x},${to.y}`,
           "--snapshot",
           input.snapshot_id,
           "--global",
@@ -583,9 +629,9 @@ export function registerComputerUseTools(
         const args = [
           "drag",
           "--from",
-          `${input.from.x},${input.from.y}`,
+          `${from.x},${from.y}`,
           "--to",
-          `${input.to.x},${input.to.y}`,
+          `${to.x},${to.y}`,
           "--window-id",
           String(target.windowId),
         ]
@@ -608,6 +654,7 @@ export function registerComputerUseTools(
 
   const appSchema = z
     .object({
+      ...observeAfterField,
       action: z.enum(["launch", "switch", "quit", "relaunch", "hide", "unhide"]),
       app: appInput,
       open: z.array(z.string().min(1)).max(10).default([]).describe("Files or URLs to open."),
@@ -628,7 +675,7 @@ export function registerComputerUseTools(
       }
     })
 
-  registerTool(
+  registerAction(
     "computer_app",
     {
       description: "Launch, switch to, quit, relaunch, hide, or unhide an app.",
@@ -648,6 +695,7 @@ export function registerComputerUseTools(
 
   const windowSchema = z
     .object({
+      ...observeAfterField,
       action: z.enum([
         "focus",
         "close",
@@ -718,7 +766,7 @@ export function registerComputerUseTools(
       }
     })
 
-  registerTool(
+  registerAction(
     "computer_window",
     {
       description: "Focus, close, minimize, restore, maximize, move, resize, or set window bounds.",
@@ -794,39 +842,6 @@ function appCommandArgs(
   return ["app", action, "--app", app]
 }
 
-function observationResult(observation: DesktopObservation, savedPath?: string): CallToolResult {
-  const data = asRecord(observation.data) ?? {}
-  const application = stringValue(data.application_name)
-  const windowTitle = stringValue(data.window_title)
-  const structuredContent = omitUndefined({
-    snapshot_id: stringValue(data.snapshot_id),
-    application_name: application,
-    window_title: windowTitle,
-    is_dialog: booleanValue(data.is_dialog),
-    capture_mode: stringValue(data.capture_mode),
-    element_count: numberValue(data.element_count),
-    interactable_count: numberValue(data.interactable_count),
-    truncated: booleanValue(data.truncated),
-    saved_path: savedPath,
-  })
-  const target = [application, windowTitle].filter(Boolean).join(" — ") || "computer"
-
-  return {
-    structuredContent,
-    content: [
-      {
-        type: "text",
-        text: `Observed ${target}.${data.truncated ? " The element list is partial; use computer_inspect with offset for the rest." : ""}${savedPath ? ` Saved to ${savedPath}.` : ""}`,
-      },
-      {
-        type: "image",
-        data: observation.imageData,
-        mimeType: observation.mimeType,
-      },
-    ],
-  }
-}
-
 function inspectionResult(result: DesktopResult): CallToolResult {
   const data = asRecord(result.data)
   const snapshotId = stringValue(data?.snapshot_id)
@@ -858,12 +873,7 @@ function inspectionResult(result: DesktopResult): CallToolResult {
     "Inspected accessible UI."
   return {
     content: [{ type: "text", text: snapshotId ? `snapshot_id=${snapshotId}\n${text}` : text }],
-    ...(snapshotId ? { structuredContent: { snapshot_id: snapshotId, text } } : {}),
   }
-}
-
-function omitUndefined(value: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined))
 }
 
 function stringValue(value: unknown): string | undefined {
