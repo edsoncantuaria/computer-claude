@@ -35,7 +35,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 BUS_NAME = "io.github.edsoncantuaria.ComputerClaude"
 OBJECT_PATH = "/io/github/edsoncantuaria/ComputerClaude"
 INTERFACE = "io.github.edsoncantuaria.ComputerClaude"
-SUPPORTED_API = 4
+SUPPORTED_API = 4  # the oldest extension this helper can drive
+CURSOR_API = 5  # first extension that draws the agent cursor
 
 SNAPSHOT_LIMIT = 64
 ELEMENT_TIME_BUDGET_S = 4.0
@@ -173,10 +174,11 @@ class Desktop:
                 "Run /computer-claude:setup in Claude Code, then log out and back in.",
             )
         api = json.loads(self.call("Ping")).get("api")
-        if api != SUPPORTED_API:
+        self.api = api if isinstance(api, int) else 0
+        if self.api < SUPPORTED_API:
             raise Fail(
                 "DESKTOP_EXTENSION_OUTDATED",
-                f"The Computer Claude extension speaks API {api}; this helper needs {SUPPORTED_API}. "
+                f"The Computer Claude extension speaks API {api}; this helper needs {SUPPORTED_API} or newer. "
                 "Run /computer-claude:setup in Claude Code, then log out and back in.",
             )
 
@@ -217,6 +219,15 @@ class Desktop:
 
     def get_clipboard(self):
         return self.call("GetClipboard")
+
+    def agent_cursor(self, x, y, action="move", label=""):
+        """Show the agent's cursor where an action lands; purely visual, so it never fails the action."""
+        if self.api < CURSOR_API:
+            return
+        try:
+            self.call("AgentCursor", GLib.Variant("(ddss)", (float(x), float(y), action, label)))
+        except Fail:
+            pass
 
     def pointer_move(self, x, y):
         self.call("PointerMove", GLib.Variant("(dd)", (float(x), float(y))))
@@ -867,11 +878,29 @@ def focused_editable(window):
     return focused if focused is not None else (fields[0] if len(fields) == 1 else None)
 
 
-def insert_without_focus(window, text, clear):
+def show_typing(desktop, window, field):
+    """Put the agent cursor on the field being typed into, or on its window when that is unknown."""
+    point = (window["x"] + window["width"] / 2, window["y"] + window["height"] / 2) if window else None
+    try:
+        frame = accessible_frame(window) if window and field is not None else None
+        field_box, frame_box = (extents_of(field), extents_of(frame)) if frame is not None else (None, None)
+        if field_box and frame_box and field_box[2] > 0 and field_box[3] > 0:
+            point = (
+                window["x"] + field_box[0] - frame_box[0] + field_box[2] / 2,
+                window["y"] + field_box[1] - frame_box[1] + field_box[3] / 2,
+            )
+    except GLib.Error:
+        pass
+    if point:
+        desktop.agent_cursor(*point, "type", "typing")
+
+
+def insert_without_focus(desktop, window, text, clear):
     """Write straight into a window's focused field; False when it cannot take the text this way."""
     field = focused_editable(window)
     if field is None or ("\n" in text and field.get_role() != Atspi.Role.TEXT):
         return False
+    show_typing(desktop, window, field)
     try:
         editable, content = field.get_editable_text_iface(), field.get_text_iface()
         if editable is None or content is None:
@@ -1069,7 +1098,7 @@ def command_see(desktop, positional, options):
             raise Fail("SCREEN_NOT_FOUND", f"No screen has index {screen_index}.")
         bounds = bounds_of(monitor)
         if capture:
-            desktop.screenshot("screen", screen_index, path)
+            desktop.screenshot("screen+cursor" if options.get("--with-cursor") else "screen", screen_index, path)
             to_logical_size(path, bounds)
         elements, lines, truncated = [], [], False
         if tree or not options.get("--no-elements"):
@@ -1226,6 +1255,7 @@ def command_click(desktop, positional, options):
         plain_click = button == BUTTONS["left"] and count == 1 and not hold
         if plain_click and not options.get("--foreground"):
             window = element_window(desktop, snapshot, element)
+            desktop.agent_cursor(*element_center(window, element), "click")
             if activate_element(window, element):
                 return {"clicked": target, "via": "accessibility"}, f"Activated {target}."
             if grab_field_focus(desktop, window, element, positional[0] if positional else None):
@@ -1315,11 +1345,12 @@ def command_type(desktop, positional, options):
     window = target_window(desktop, options)
     clear = bool(options.get("--clear"))
     if window is not None and not window["focused"] and not options.get("--foreground"):
-        if insert_without_focus(window, text, clear):
+        if insert_without_focus(desktop, window, text, clear):
             return {"typed_characters": len(text), "via": "accessibility"}, f"Typed {len(text)} characters."
     receiver = window or next((item for item in desktop.windows() if item["focused"]), None)
     field = focused_editable(receiver) if receiver is not None else None
     before = field_length(field) if field is not None else None
+    show_typing(desktop, receiver, field)
     with borrowed_focus(desktop, window, options):
         result = type_with_keys(desktop, text, clear, integer(options, "--delay", 6) / 1000)
         time.sleep(0.05)
@@ -1409,7 +1440,12 @@ def command_press(desktop, positional, options):
         raise Fail("INVALID_ARGUMENTS", "Supply at least one key.")
     chords = [keysyms_for_token(token) for token in positional]
     desktop.ensure_input_available()
-    with borrowed_focus(desktop, target_window(desktop, options), options):
+    window = target_window(desktop, options)
+    if window is not None:
+        desktop.agent_cursor(
+            window["x"] + window["width"] / 2, window["y"] + window["height"] / 2, "key", " ".join(positional)
+        )
+    with borrowed_focus(desktop, window, options):
         for _ in range(integer(options, "--count", 1)):
             for chord in chords:
                 desktop.chord(chord)

@@ -22,7 +22,7 @@ import * as Main from "resource:///org/gnome/shell/ui/main.js"
 const BUS_NAME = "io.github.edsoncantuaria.ComputerClaude"
 const OBJECT_PATH = "/io/github/edsoncantuaria/ComputerClaude"
 const ERROR_NAME = "io.github.edsoncantuaria.ComputerClaude.Error"
-const API_VERSION = 4
+const API_VERSION = 5
 
 const INTERFACE = `
 <node>
@@ -44,6 +44,12 @@ const INTERFACE = `
     <method name="PointerMove">
       <arg type="d" name="x" direction="in"/>
       <arg type="d" name="y" direction="in"/>
+    </method>
+    <method name="AgentCursor">
+      <arg type="d" name="x" direction="in"/>
+      <arg type="d" name="y" direction="in"/>
+      <arg type="s" name="action" direction="in"/>
+      <arg type="s" name="label" direction="in"/>
     </method>
     <method name="Hold">
       <arg type="s" name="kind" direction="in"/>
@@ -118,8 +124,17 @@ const POPUP_WINDOW_TYPES = new Set([
 const HOLD_LIMIT_MS = 30_000
 const MAX_WORKSPACE_INDEX = 35
 
-const CURSOR_SIZE = 18
-const CURSOR_LINGER_MS = 1500
+// The agent's own cursor: it shows where Claude is acting, whether or not it moves the real pointer.
+const CURSOR_LINGER_MS = 1800
+const CURSOR_FADE_MS = 350
+const CURSOR_TRAVEL_MS = [140, 420]
+const CURSOR_PX_PER_MS = 1.6
+const TRAIL_SPACING_PX = 5
+const TRAIL_FADE_MS = 800
+const FRAME_MS = 16
+// Claude's orange.
+const ORANGE = "rgba(217, 119, 87, ALPHA)"
+const color = (alpha) => ORANGE.replace("ALPHA", String(alpha))
 
 function rectangle(rect) {
   return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
@@ -174,29 +189,218 @@ function unmaximize(window) {
   else window.unmaximize()
 }
 
+class AgentCursor {
+  constructor() {
+    this._layer = new St.Widget({ reactive: false, visible: false, opacity: 0 })
+    this._arrow = new St.DrawingArea({ width: 36, height: 36, reactive: false })
+    this._arrow.connect("repaint", (area) => {
+      const cr = area.get_context()
+      cr.scale(1.45, 1.45)
+      cr.moveTo(2, 2)
+      cr.lineTo(2, 19)
+      cr.lineTo(6.5, 15)
+      cr.lineTo(9.5, 21.5)
+      cr.lineTo(12.5, 20)
+      cr.lineTo(9.5, 13.5)
+      cr.lineTo(15.5, 13.5)
+      cr.closePath()
+      // A dark rim under the white one keeps the arrow visible on orange and white backgrounds alike.
+      cr.setSourceRGBA(0, 0, 0, 0.55)
+      cr.setLineWidth(3.6)
+      cr.strokePreserve()
+      cr.setSourceRGBA(0.851, 0.467, 0.341, 1)
+      cr.fillPreserve()
+      cr.setSourceRGBA(1, 1, 1, 1)
+      cr.setLineWidth(1.8)
+      cr.stroke()
+      cr.$dispose()
+    })
+    this._label = new St.Label({
+      text: "Claude",
+      style: `background-color: ${color(0.95)}; color: white; border-radius: 10px; padding: 2px 9px; font-size: 11px; font-weight: bold;`,
+    })
+    this._layer.add_child(this._arrow)
+    this._layer.add_child(this._label)
+    Main.uiGroup.add_child(this._layer)
+    this._x = null
+    this._y = null
+    this._tween = 0
+    this._linger = 0
+    this._pending = null
+    this._trail = new Set()
+  }
+
+  destroy() {
+    this.hide()
+    this._layer.destroy()
+    this._layer = null
+  }
+
+  // Moves the arrow along an eased path, leaving a fading trail. `done` runs on arrival.
+  moveTo(x, y, { label = "", click = false, done = null } = {}) {
+    this._stopTween()
+    this._pending = done
+    this._setLabel(label)
+    this._reveal()
+    const fromX = this._x ?? x
+    const fromY = this._y ?? y
+    const distance = Math.hypot(x - fromX, y - fromY)
+    const duration = Math.min(
+      CURSOR_TRAVEL_MS[1],
+      Math.max(CURSOR_TRAVEL_MS[0], distance / CURSOR_PX_PER_MS)
+    )
+    const started = GLib.get_monotonic_time()
+    let lastDot = [fromX, fromY]
+    const step = () => {
+      const t = Math.min((GLib.get_monotonic_time() - started) / 1000 / duration, 1)
+      const eased = 1 - (1 - t) ** 3
+      this._place(fromX + (x - fromX) * eased, fromY + (y - fromY) * eased)
+      if (Math.hypot(this._x - lastDot[0], this._y - lastDot[1]) >= TRAIL_SPACING_PX) {
+        this._dot(this._x, this._y)
+        lastDot = [this._x, this._y]
+      }
+      if (t < 1) return GLib.SOURCE_CONTINUE
+      this._tween = 0
+      if (click) this._ripple(x, y)
+      this._scheduleFade()
+      this._settle()
+      return GLib.SOURCE_REMOVE
+    }
+    this._tween = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FRAME_MS, step)
+  }
+
+  ripple(x, y) {
+    if (this._layer.visible) this._ripple(x, y)
+  }
+
+  // Gone at once, as screenshots must not show the agent's own overlay.
+  hide() {
+    this._stopTween()
+    if (this._linger) GLib.source_remove(this._linger)
+    this._linger = 0
+    for (const dot of this._trail) dot.destroy()
+    this._trail.clear()
+    this._layer.remove_all_transitions()
+    this._layer.opacity = 0
+    this._layer.hide()
+  }
+
+  // A caller waiting for the arrow must never be left hanging by a newer move or a hide.
+  _stopTween() {
+    if (this._tween) GLib.source_remove(this._tween)
+    this._tween = 0
+    this._settle()
+  }
+
+  _settle() {
+    const done = this._pending
+    this._pending = null
+    if (done) done()
+  }
+
+  _reveal() {
+    if (this._linger) GLib.source_remove(this._linger)
+    this._linger = 0
+    Main.uiGroup.set_child_above_sibling(this._layer, null)
+    this._layer.show()
+    this._layer.remove_all_transitions()
+    this._layer.ease({ opacity: 255, duration: 90, mode: Clutter.AnimationMode.EASE_OUT_QUAD })
+  }
+
+  _scheduleFade() {
+    if (this._linger) GLib.source_remove(this._linger)
+    this._linger = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CURSOR_LINGER_MS, () => {
+      this._linger = 0
+      this._layer.ease({
+        opacity: 0,
+        duration: CURSOR_FADE_MS,
+        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        onComplete: () => {
+          if (this._layer && this._layer.opacity === 0) this._layer.hide()
+        },
+      })
+      return GLib.SOURCE_REMOVE
+    })
+  }
+
+  _setLabel(label) {
+    this._label.text = label ? `Claude · ${label}` : "Claude"
+  }
+
+  _place(x, y) {
+    this._x = x
+    this._y = y
+    // The arrow's tip is at (2, 2) in its own space.
+    this._arrow.set_position(Math.round(x - 3), Math.round(y - 3))
+    this._label.set_position(Math.round(x + 18), Math.round(y + 26))
+  }
+
+  _dot(x, y) {
+    const size = 11
+    const dot = new St.Widget({
+      reactive: false,
+      width: size,
+      height: size,
+      style: `background-color: ${color(0.9)}; border-radius: ${size}px; box-shadow: 0 0 9px ${color(0.8)};`,
+    })
+    dot.set_pivot_point(0.5, 0.5)
+    dot.set_position(Math.round(x - size / 2), Math.round(y - size / 2))
+    this._layer.insert_child_below(dot, this._arrow)
+    this._trail.add(dot)
+    dot.ease({
+      opacity: 0,
+      scale_x: 0.2,
+      scale_y: 0.2,
+      duration: TRAIL_FADE_MS,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      onComplete: () => {
+        this._trail.delete(dot)
+        dot.destroy()
+      },
+    })
+  }
+
+  _ripple(x, y) {
+    const size = 16
+    const ring = new St.Widget({
+      reactive: false,
+      width: size,
+      height: size,
+      style: `border: 3px solid ${color(0.95)}; border-radius: ${size}px; box-shadow: 0 0 8px ${color(0.7)};`,
+    })
+    ring.set_pivot_point(0.5, 0.5)
+    ring.set_position(Math.round(x - size / 2), Math.round(y - size / 2))
+    this._layer.insert_child_below(ring, this._arrow)
+    this._trail.add(ring)
+    ring.ease({
+      opacity: 0,
+      scale_x: 3.5,
+      scale_y: 3.5,
+      duration: 750,
+      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+      onComplete: () => {
+        this._trail.delete(ring)
+        ring.destroy()
+      },
+    })
+  }
+}
+
 class DesktopService {
   constructor() {
     const seat = Clutter.get_default_backend().get_default_seat()
     this._pointer = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE)
     this._keyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE)
     this._tracker = Shell.WindowTracker.get_default()
-    this._cursor = new St.Widget({
-      style: `width: ${CURSOR_SIZE}px; height: ${CURSOR_SIZE}px; border-radius: ${CURSOR_SIZE}px; background-color: rgba(255, 60, 120, 0.85); border: 2px solid white;`,
-      reactive: false,
-      visible: false,
-    })
-    Main.uiGroup.add_child(this._cursor)
-    this._cursorTimer = 0
+    this._agent = new AgentCursor()
     this._held = new Map()
     this._holdTimer = 0
   }
 
   destroy() {
     this.ReleaseHeld()
-    if (this._cursorTimer) GLib.source_remove(this._cursorTimer)
-    this._cursorTimer = 0
-    this._cursor.destroy()
-    this._cursor = null
+    this._agent.destroy()
+    this._agent = null
     this._pointer = null
     this._keyboard = null
   }
@@ -310,8 +514,10 @@ class DesktopService {
     )
   }
 
-  async _screenshot(kind, id, path) {
-    this._hideCursor()
+  async _screenshot(requestedKind, id, path) {
+    // "screen+cursor" keeps the agent's overlay in the picture, for demonstrations.
+    const kind = requestedKind.replace("+cursor", "")
+    if (kind === requestedKind) this._agent.hide()
     const file = Gio.File.new_for_path(path)
     // Callers share the session bus, so this write must not reach arbitrary files.
     if (!file.get_path().startsWith(`${GLib.get_user_runtime_dir()}/computer-claude/`))
@@ -377,7 +583,17 @@ class DesktopService {
 
   PointerMove(x, y) {
     this._pointer.notify_absolute_motion(GLib.get_monotonic_time(), x, y)
-    this._showCursor(x, y)
+    this._agent.moveTo(x, y)
+  }
+
+  // Shows where the agent is about to act, for actions that never touch the real pointer.
+  // The call returns once the arrow has arrived, so the action happens where the user is looking.
+  AgentCursorAsync([x, y, action, label], invocation) {
+    this._agent.moveTo(x, y, {
+      label,
+      click: action === "click",
+      done: () => invocation.return_value(null),
+    })
   }
 
   // A system dialog or the lock screen takes all input away from applications.
@@ -436,25 +652,8 @@ class DesktopService {
     this._pointer.notify_absolute_motion(GLib.get_monotonic_time(), x, y)
   }
 
-  _showCursor(x, y) {
-    this._cursor.set_position(Math.round(x - CURSOR_SIZE / 2), Math.round(y - CURSOR_SIZE / 2))
-    Main.uiGroup.set_child_above_sibling(this._cursor, null)
-    this._cursor.show()
-    if (this._cursorTimer) GLib.source_remove(this._cursorTimer)
-    this._cursorTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CURSOR_LINGER_MS, () => {
-      this._cursorTimer = 0
-      this._cursor.hide()
-      return GLib.SOURCE_REMOVE
-    })
-  }
-
-  _hideCursor() {
-    if (this._cursorTimer) GLib.source_remove(this._cursorTimer)
-    this._cursorTimer = 0
-    this._cursor.hide()
-  }
-
   PointerButton(button, pressed) {
+    if (pressed) this._agent.ripple(...global.get_pointer())
     this._pointer.notify_button(
       GLib.get_monotonic_time(),
       button,

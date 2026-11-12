@@ -65,6 +65,12 @@ Tools that change the desktop (`computer_click`, `computer_type`, `computer_pres
 
 The plugin also ships a skill, `using-the-desktop`, that teaches Claude how to use these tools: observe a window, act on elements instead of coordinates, confirm the effect, and what to ask you first.
 
+## The agent cursor
+
+While Claude acts, an orange cursor labelled "Claude" glides to where the action lands and leaves a fading trail; clicks end in a ripple. It is Claude's own cursor, drawn by the GNOME Shell extension above all windows, so you can follow what it does even when an action never touches your real pointer (element clicks, typing, key presses). Typing shows "typing", never the text; key presses show the keys. The cursor fades after about two seconds and is hidden while screenshots are taken, so Claude never sees it.
+
+An extension older than v0.3.0 keeps working but draws only a dot for real pointer moves; log out and back in once after updating to get the full cursor.
+
 ## How it works
 
 | Part | Role |
