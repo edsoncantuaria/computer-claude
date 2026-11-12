@@ -1,0 +1,7 @@
+{
+  "uuid": "computer-claude@edsoncantuaria",
+  "name": "Computer Claude",
+  "description": "Session D-Bus service that lets the Computer Claude plugin for Claude Code list and manage windows, capture screenshots, and inject pointer and keyboard input.",
+  "shell-version": ["50"],
+  "url": "https://github.com/edsoncantuaria/computer-claude"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "computer-claude",
+  "version": "0.1.0",
+  "description": "Computer Use for Claude Code on GNOME Wayland: Claude sees your desktop and drives it with screenshots, element trees, clicks, typing, keys, scrolling, drags, windows, apps, and the clipboard.",
+  "author": {
+    "name": "edsoncantuaria",
+    "url": "https://github.com/edsoncantuaria"
+  },
+  "homepage": "https://github.com/edsoncantuaria/computer-claude",
+  "repository": "https://github.com/edsoncantuaria/computer-claude",
+  "license": "MIT",
+  "keywords": ["computer-use", "desktop", "gnome", "wayland", "linux", "mcp"]
+}

@@ -1,0 +1,1832 @@
+#!/usr/bin/python3
+"""Computer Claude: Computer Use command line for GNOME on Wayland.
+
+Speaks the command dialect and JSON envelope that src/desktop-client.ts
+expects, so the MCP tool layer stays independent of the desktop backend.
+
+Compositor-only primitives (window list and geometry, screenshots, pointer and
+keyboard injection) come from the Computer Claude GNOME Shell extension over the
+session bus. Accessible element trees come from AT-SPI. Wayland has no background
+input, so every action first focuses its target window and then drives the real
+pointer and keyboard.
+"""
+
+import json
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import warnings
+from contextlib import contextmanager
+
+import gi
+
+gi.require_version("Atspi", "2.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Atspi, Gdk, GdkPixbuf, Gio, GLib  # noqa: E402
+
+# PyGObject reports the only exported AT-SPI action accessors as deprecated.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+BUS_NAME = "io.github.edsoncantuaria.ComputerClaude"
+OBJECT_PATH = "/io/github/edsoncantuaria/ComputerClaude"
+INTERFACE = "io.github.edsoncantuaria.ComputerClaude"
+SUPPORTED_API = 4
+
+SNAPSHOT_LIMIT = 64
+ELEMENT_TIME_BUDGET_S = 4.0
+OBSERVE_MAX_ELEMENTS = 200
+OBSERVE_MAX_DEPTH = 40
+OBSERVE_MAX_CHILDREN = 200
+SCREEN_ELEMENT_TIME_BUDGET_S = 6.0
+OCR_MIN_CONFIDENCE = 50.0
+OCR_TIMEOUT_S = 15
+TREE_ELEMENT_TIME_BUDGET_S = 12.0
+DELIVERY_CONFIRM_BUDGET_S = 1.5
+MINIMIZED_RESTORE_WAIT_S = 0.4
+SHELL_WINDOW_ID = 0
+SHELL_WINDOW_ACTOR_LABELS = ("Wayland ", "X11 ")
+APP_LAUNCH_TIMEOUT_S = 25
+FOCUS_SEARCH_BUDGET_S = 1.0
+SMOOTH_SCROLL_FRAMES = 6
+SMOOTH_SCROLL_DISTANCE = 10.0
+KEYSYM_SHIFT = 0xFFE1
+KEYSYM_LEVEL3 = 0xFE03
+NON_ACTIVATABLE_ROLES = {"text", "entry", "password text", "terminal"}
+PREFERRED_ACTIONS = ("click", "press", "activate", "toggle", "jump", "select")
+
+# Options that consume the following argument. Every other "--name" is a flag.
+VALUED_OPTIONS = {
+    "--app", "--window-id", "--window-title", "--snapshot", "--path", "--mode",
+    "--screen-index", "--depth", "--max-elements", "--max-children", "--on", "--at",
+    "--wait-for", "--text", "--delay", "--count", "--direction", "--amount", "--from",
+    "--to", "--duration", "--steps", "--dx", "--dy", "--keys", "--button", "--action", "--screen", "--workspace", "--skip", "--x", "--y", "--width", "--height",
+}
+REPEATED_OPTIONS = {"--open"}
+
+BUTTONS = {"left": 1, "middle": 2, "right": 3}
+
+KEYSYMS = {
+    "return": 0xFF0D, "enter": 0xFF0D, "tab": 0xFF09, "escape": 0xFF1B, "esc": 0xFF1B,
+    "space": 0x0020, "backspace": 0xFF08, "delete": 0xFFFF, "forward_delete": 0xFFFF,
+    "insert": 0xFF63, "home": 0xFF50, "end": 0xFF57, "pageup": 0xFF55, "page_up": 0xFF55,
+    "pagedown": 0xFF56, "page_down": 0xFF56, "left": 0xFF51, "up": 0xFF52,
+    "right": 0xFF53, "down": 0xFF54, "arrow_left": 0xFF51, "arrow_up": 0xFF52,
+    "arrow_right": 0xFF53, "arrow_down": 0xFF54, "shift": 0xFFE1, "ctrl": 0xFFE3,
+    "control": 0xFFE3, "alt": 0xFFE9, "option": 0xFFE9, "super": 0xFFEB, "meta": 0xFFEB,
+    "cmd": 0xFFE3, "command": 0xFFE3, "win": 0xFFEB, "menu": 0xFF67, "print": 0xFF61,
+    "caps_lock": 0xFFE5, "minus": 0x002D, "plus": 0x002B, "equal": 0x003D,
+    "comma": 0x002C, "period": 0x002E, "slash": 0x002F, "backslash": 0x005C,
+    "semicolon": 0x003B, "underscore": 0x005F,
+}
+KEYSYMS.update({f"f{index}": 0xFFBD + index for index in range(1, 13)})
+
+INTERACTIVE_ROLES = {
+    Atspi.Role.PUSH_BUTTON, Atspi.Role.TOGGLE_BUTTON, Atspi.Role.CHECK_BOX,
+    Atspi.Role.RADIO_BUTTON, Atspi.Role.MENU, Atspi.Role.MENU_ITEM,
+    Atspi.Role.CHECK_MENU_ITEM, Atspi.Role.RADIO_MENU_ITEM, Atspi.Role.LINK,
+    Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT, Atspi.Role.COMBO_BOX,
+    Atspi.Role.LIST_ITEM, Atspi.Role.PAGE_TAB, Atspi.Role.SLIDER,
+    Atspi.Role.SPIN_BUTTON, Atspi.Role.TREE_ITEM, Atspi.Role.TABLE_CELL,
+    Atspi.Role.TEXT, Atspi.Role.SWITCH if hasattr(Atspi.Role, "SWITCH") else Atspi.Role.TOGGLE_BUTTON,
+}
+EDITABLE_ROLES = {Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT, Atspi.Role.TEXT}
+FRAME_ROLES = {Atspi.Role.FRAME, Atspi.Role.WINDOW, Atspi.Role.DIALOG, Atspi.Role.ALERT}
+
+
+class Fail(Exception):
+    def __init__(self, code, message, details=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def parse_args(argv):
+    positional, options = [], {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in VALUED_OPTIONS or token in REPEATED_OPTIONS:
+            if index + 1 >= len(argv):
+                raise Fail("INVALID_ARGUMENTS", f"{token} requires a value.")
+            value = argv[index + 1]
+            if token in REPEATED_OPTIONS:
+                options.setdefault(token, []).append(value)
+            else:
+                options[token] = value
+            index += 2
+        elif token.startswith("--"):
+            options[token] = True
+            index += 1
+        else:
+            positional.append(token)
+            index += 1
+    return positional, options
+
+
+def integer(options, name, default=None):
+    if name not in options:
+        return default
+    try:
+        return int(float(options[name]))
+    except ValueError:
+        raise Fail("INVALID_ARGUMENTS", f"{name} must be a number.") from None
+
+
+def point(options, name):
+    try:
+        x, y = (float(part) for part in options[name].split(","))
+    except (ValueError, AttributeError):
+        raise Fail("INVALID_ARGUMENTS", f"{name} must be formatted as x,y.") from None
+    return x, y
+
+
+# ------------------------------------------------------------------- compositor
+
+
+class Desktop:
+    """Client for the Computer Claude GNOME Shell extension."""
+
+    def __init__(self):
+        try:
+            self.proxy = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SESSION,
+                Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES | Gio.DBusProxyFlags.DO_NOT_AUTO_START,
+                None, BUS_NAME, OBJECT_PATH, INTERFACE, None,
+            )
+        except GLib.Error as error:
+            raise Fail("SESSION_BUS_UNAVAILABLE", "The desktop session bus is unavailable.", error.message) from None
+        if not self.proxy.get_name_owner():
+            raise Fail(
+                "DESKTOP_EXTENSION_MISSING",
+                "The Computer Claude GNOME Shell extension is not running. "
+                "Run /computer-claude:setup in Claude Code, then log out and back in.",
+            )
+        api = json.loads(self.call("Ping")).get("api")
+        if api != SUPPORTED_API:
+            raise Fail(
+                "DESKTOP_EXTENSION_OUTDATED",
+                f"The Computer Claude extension speaks API {api}; this helper needs {SUPPORTED_API}. "
+                "Run /computer-claude:setup in Claude Code, then log out and back in.",
+            )
+
+    def call(self, method, parameters=None):
+        try:
+            result = self.proxy.call_sync(method, parameters, Gio.DBusCallFlags.NONE, 20_000, None)
+        except GLib.Error as error:
+            Gio.DBusError.strip_remote_error(error)
+            message = error.message
+            code, separator, rest = message.partition(": ")
+            if separator and code.isupper() and " " not in code:
+                raise Fail(code, rest) from None
+            raise Fail("DESKTOP_COMMAND_FAILED", message) from None
+        return result.unpack()[0] if result is not None and result.n_children() else None
+
+    def windows(self):
+        return json.loads(self.call("ListWindows"))
+
+    def monitors(self):
+        return json.loads(self.call("ListMonitors"))
+
+    def window_action(self, window_id, action, geometry=()):
+        self.call("WindowAction", GLib.Variant("(tsai)", (window_id, action, list(geometry))))
+
+    def screenshot(self, kind, target_id, path):
+        # The extension only writes inside the runtime directory.
+        capture = os.path.join(snapshot_directory(), f"capture-{secrets.token_hex(4)}.png")
+        try:
+            bounds = json.loads(self.call("Screenshot", GLib.Variant("(sts)", (kind, target_id, capture))))
+            shutil.move(capture, path)
+        finally:
+            if os.path.exists(capture):
+                os.unlink(capture)
+        return bounds
+
+    def hold(self, kind, code, pressed):
+        self.call("Hold", GLib.Variant("(sub)", (kind, code, pressed)))
+
+    def get_clipboard(self):
+        return self.call("GetClipboard")
+
+    def pointer_move(self, x, y):
+        self.call("PointerMove", GLib.Variant("(dd)", (float(x), float(y))))
+
+    def ensure_input_available(self):
+        """Refuse input a system dialog or the lock screen would silently swallow."""
+        state = json.loads(self.call("ShellState"))
+        if state["locked"]:
+            raise Fail("SCREEN_LOCKED", "The screen is locked. Ask the user to unlock it.")
+        if state["dialog"]:
+            raise Fail(
+                "SYSTEM_DIALOG_ACTIVE",
+                "A system dialog is holding the keyboard and pointer, so input would not reach the app. "
+                "Observe the screen and ask the user to answer it.",
+            )
+
+    def pointer_relative(self, dx, dy):
+        self.call("PointerRelative", GLib.Variant("(dd)", (float(dx), float(dy))))
+
+    def pointer_position(self):
+        return self.call("PointerPosition")
+
+    def pointer_warp(self, x, y):
+        self.call("PointerWarp", GLib.Variant("(dd)", (float(x), float(y))))
+
+    def pointer_button(self, button, pressed):
+        self.call("PointerButton", GLib.Variant("(ub)", (button, pressed)))
+
+    def scroll(self, direction, steps):
+        self.call("Scroll", GLib.Variant("(su)", (direction, steps)))
+
+    def key(self, keyval, pressed):
+        self.call("Key", GLib.Variant("(ub)", (keyval, pressed)))
+
+    def keyboard_group(self):
+        return self.call("KeyboardGroup")
+
+    def commit_text(self, text):
+        return self.call("CommitText", GLib.Variant("(s)", (text,)))
+
+    def scroll_continuous(self, dx, dy, finish):
+        self.call("ScrollContinuous", GLib.Variant("(ddb)", (float(dx), float(dy), finish)))
+
+    def set_clipboard(self, text):
+        self.call("SetClipboard", GLib.Variant("(s)", (text,)))
+
+    # -- composed input ------------------------------------------------------
+
+    def tap(self, keyval):
+        self.key(keyval, True)
+        self.key(keyval, False)
+
+    def chord(self, keyvals):
+        for keyval in keyvals:
+            self.key(keyval, True)
+        time.sleep(0.03)
+        for keyval in reversed(keyvals):
+            self.key(keyval, False)
+
+    def click(self, x, y, button=1, count=1, hold_s=0.0):
+        self.pointer_move(x, y)
+        time.sleep(0.05)
+        for index in range(count):
+            self.pointer_button(button, True)
+            time.sleep(hold_s if hold_s else 0.02)
+            self.pointer_button(button, False)
+            if index + 1 < count:
+                time.sleep(0.07)
+
+    def focus(self, window):
+        """Raise and focus a window, waiting until the compositor reports it focused."""
+        if window["focused"] and not window["minimized"]:
+            return
+        self.window_action(window["id"], "focus")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            current = next((item for item in self.windows() if item["id"] == window["id"]), None)
+            if current is None:
+                raise Fail("WINDOW_NOT_FOUND", "The window closed before it could be focused.")
+            if current["focused"]:
+                window.update(current)
+                time.sleep(0.1)
+                return
+        raise Fail("WINDOW_FOCUS_FAILED", f"Window {window['id']} did not take focus.")
+
+
+# ---------------------------------------------------------------- window lookup
+
+
+def window_view(window):
+    return {
+        "window_id": window["id"],
+        "title": window["title"],
+        "app": window["app"] or window["wm_class"],
+        "pid": window["pid"],
+        "bounds": bounds_of(window),
+        "is_focused": window["focused"],
+        "is_minimized": window["minimized"],
+        "is_maximized": window["maximized"],
+        "screen_index": window["monitor"],
+        "workspace": window["workspace"],
+    }
+
+
+def bounds_of(item):
+    return {"x": item["x"], "y": item["y"], "width": item["width"], "height": item["height"]}
+
+
+def front_first(windows):
+    return sorted(windows, key=lambda item: (not item["focused"], item["minimized"], -item["stacking"]))
+
+
+def app_names(window):
+    app_id = window["app_id"]
+    return [
+        name.casefold()
+        for name in (window["app"], app_id, app_id.removesuffix(".desktop"), window["wm_class"])
+        if name
+    ]
+
+
+def app_windows(windows, app):
+    if app.upper().startswith("PID:"):
+        try:
+            pid = int(app[4:])
+        except ValueError:
+            raise Fail("INVALID_TARGET", "PID targets must look like PID:12345.") from None
+        return front_first([item for item in windows if item["pid"] == pid])
+    wanted = app.casefold()
+    exact = [item for item in windows if wanted in app_names(item)]
+    if exact:
+        return front_first(exact)
+    return front_first([item for item in windows if any(wanted in name for name in app_names(item))])
+
+
+def resolve_window(desktop, options, snapshot=None, required=True):
+    windows = desktop.windows()
+    if "--window-id" in options:
+        window_id = integer(options, "--window-id")
+        window = next((item for item in windows if item["id"] == window_id), None)
+        if window is None:
+            raise Fail("WINDOW_NOT_FOUND", f"No window has ID {window_id}. Call computer_list again.")
+        return window
+    if "--app" in options:
+        candidates = app_windows(windows, options["--app"])
+        title = options.get("--window-title")
+        if title:
+            wanted = title.casefold()
+            candidates = [item for item in candidates if wanted in item["title"].casefold()]
+        if not candidates:
+            raise Fail("APP_NOT_FOUND", f"No open window matches app {options['--app']!r}.")
+        return candidates[0]
+    if snapshot and snapshot.get("window_id") is not None:
+        window = next((item for item in windows if item["id"] == snapshot["window_id"]), None)
+        if window is None:
+            raise Fail("WINDOW_NOT_FOUND", "The observed window is gone. Call computer_observe again.")
+        return window
+    focused = next((item for item in windows if item["focused"]), None)
+    if focused is None and required:
+        raise Fail("WINDOW_NOT_FOUND", "No window is focused.")
+    return focused
+
+
+# ------------------------------------------------------------------- snapshots
+
+
+def snapshot_directory():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or GLib.get_user_cache_dir()
+    directory = os.path.join(runtime, "computer-claude")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    return directory
+
+
+def save_snapshot(snapshot):
+    directory = snapshot_directory()
+    path = os.path.join(directory, f"{snapshot['id']}.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle)
+    entries = sorted(
+        (entry for entry in os.scandir(directory) if entry.name.endswith(".json")),
+        key=lambda entry: entry.stat().st_mtime,
+    )
+    for entry in entries[:-SNAPSHOT_LIMIT]:
+        for stale in (entry.path, entry.path.removesuffix(".json") + ".png"):
+            try:
+                os.unlink(stale)
+            except FileNotFoundError:
+                pass
+
+
+def load_snapshot(snapshot_id):
+    if not snapshot_id.replace("-", "").isalnum():
+        raise Fail("SNAPSHOT_NOT_FOUND", "The snapshot ID is invalid.")
+    try:
+        with open(os.path.join(snapshot_directory(), f"{snapshot_id}.json"), encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        raise Fail("SNAPSHOT_NOT_FOUND", "The snapshot expired. Call computer_observe again.") from None
+
+
+def optional_snapshot(options):
+    return load_snapshot(options["--snapshot"]) if "--snapshot" in options else None
+
+
+# ---------------------------------------------------------------- accessibility
+
+
+def accessibility_available():
+    """Probe the accessibility bus first: libatspi aborts the process when it is missing."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.call_sync(
+            "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress",
+            None, None, Gio.DBusCallFlags.NONE, 5_000, None,
+        )
+    except GLib.Error:
+        return False
+    return True
+
+
+def application_frames(application):
+    frames = []
+    for index in range(application.get_child_count()):
+        frame = application.get_child_at_index(index)
+        if frame is not None and frame.get_role() in FRAME_ROLES:
+            frames.append(frame)
+    return frames
+
+
+def accessible_frame(window):
+    """Find the AT-SPI top-level accessible that corresponds to a compositor window."""
+    desktop = Atspi.get_desktop(0)
+    own, others = [], []
+    for index in range(desktop.get_child_count()):
+        try:
+            application = desktop.get_child_at_index(index)
+            if application is None:
+                continue
+            frames = application_frames(application)
+            (own if application.get_process_id() == window["pid"] else others).extend(frames)
+        except GLib.Error:
+            continue
+    title = plain_title(window["title"])
+    if own:
+        return pick_frame(own, window, title)
+    # A sandboxed app reaches AT-SPI through a proxy, so its process ID differs: match by title.
+    return pick_frame([frame for frame in others if title and plain_title(frame.get_name()) == title], window, title)
+
+
+def plain_title(title):
+    return "".join(character for character in (title or "") if character.isprintable()).strip()
+
+
+def pick_frame(frames, window, title):
+    named = [frame for frame in frames if plain_title(frame.get_name()) == title]
+    if len(named) == 1:
+        return named[0]
+    candidates = named or frames
+    for frame in candidates:
+        extents = extents_of(frame)
+        if extents and extents[2] == window["width"] and extents[3] == window["height"]:
+            return frame
+    titled = [frame for frame in candidates if plain_title(frame.get_name())]
+    if len(titled) == 1:
+        return titled[0]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def is_chromium(frame):
+    try:
+        return frame.get_toolkit_name() == "Chromium"
+    except GLib.Error:
+        return False
+
+
+def extents_of(accessible):
+    try:
+        component = accessible.get_component_iface()
+        if component is None:
+            return None
+        rect = component.get_extents(Atspi.CoordType.WINDOW)
+    except GLib.Error:
+        return None
+    return rect.x, rect.y, rect.width, rect.height
+
+
+def related_label(accessible):
+    """Text of the element that labels this one, as GTK4 menu items expose it."""
+    for relation in accessible.get_relation_set():
+        if relation.get_relation_type() != Atspi.RelationType.LABELLED_BY:
+            continue
+        for index in range(relation.get_n_targets()):
+            target = relation.get_target(index)
+            text = target.get_text_iface()
+            label = target.get_name() or (
+                Atspi.Text.get_text(text, 0, min(Atspi.Text.get_character_count(text), 120)) if text else ""
+            )
+            if label:
+                return label
+    return ""
+
+
+def label_of(accessible):
+    try:
+        label = accessible.get_name() or accessible.get_description() or related_label(accessible)
+    except GLib.Error:
+        return ""
+    return " ".join(label.split())[:120]
+
+
+def descendant_label(accessible, depth=3):
+    """Label of a control whose text lives on a child, as in GTK4 menu items."""
+    if depth == 0:
+        return ""
+    try:
+        for index in range(min(accessible.get_child_count(), 4)):
+            child = accessible.get_child_at_index(index)
+            label = (label_of(child) or descendant_label(child, depth - 1)) if child is not None else ""
+            if label:
+                return label
+    except GLib.Error:
+        pass
+    return ""
+
+
+def element_label(accessible, role):
+    label = label_of(accessible)
+    return label or descendant_label(accessible) if role in INTERACTIVE_ROLES and role not in EDITABLE_ROLES else label
+
+
+def value_of(accessible):
+    """Current content of an editable or ranged control; password fields stay unread."""
+    try:
+        role = accessible.get_role()
+        if role in (Atspi.Role.ENTRY, Atspi.Role.TEXT):
+            text = accessible.get_text_iface()
+            if text is not None:
+                return Atspi.Text.get_text(text, 0, min(Atspi.Text.get_character_count(text), 200))
+        if role in (Atspi.Role.SLIDER, Atspi.Role.SPIN_BUTTON):
+            value = accessible.get_value_iface()
+            if value is not None:
+                return f"{Atspi.Value.get_current_value(value):g}"
+    except GLib.Error:
+        pass
+    return ""
+
+
+def collect_elements(window, max_depth, max_elements, max_children, deadline=None, first_id=1, skip=0):
+    """Walk a window's accessible tree.
+
+    Returns (elements, lines, truncated): elements carry window-relative logical
+    bounds for actions; lines are the indented text tree for the model; truncated
+    says the walk stopped early. IDs stay stable across pages requested with skip.
+    """
+    frame = accessible_frame(window) if accessibility_available() else None
+    if frame is None:
+        return [], [], False
+    origin = (0, 0, 0, 0) if window["id"] == SHELL_WINDOW_ID else extents_of(frame) or (0, 0, 0, 0)
+    # Chromium reports positions relative to its surface, which includes the window shadow.
+    if is_chromium(frame):
+        origin = (origin[0] + window["shadow_x"], origin[1] + window["shadow_y"], origin[2], origin[3])
+    deadline = deadline or time.monotonic() + ELEMENT_TIME_BUDGET_S
+    elements, lines = [], []
+    seen, truncated = 0, False
+
+    def visit(accessible, depth, indent, path):
+        nonlocal seen, truncated
+        if len(elements) >= max_elements or time.monotonic() > deadline:
+            truncated = True
+            return
+        try:
+            role = accessible.get_role()
+            states = accessible.get_state_set()
+            if depth > 0 and not states.contains(Atspi.StateType.SHOWING):
+                return
+            role_name = accessible.get_role_name()
+            child_count = accessible.get_child_count()
+        except GLib.Error:
+            return
+        label = element_label(accessible, role)
+        # GNOME Shell lists every application window; those are observed on their own.
+        if window["id"] == SHELL_WINDOW_ID and label.startswith(SHELL_WINDOW_ACTOR_LABELS):
+            return
+        extents = extents_of(accessible)
+        interactive = role in INTERACTIVE_ROLES
+        visible = extents is not None and extents[2] > 0 and extents[3] > 0
+        if visible and (interactive or label):
+            element = {
+                "id": f"E{first_id + seen}",
+                "window_id": window["id"],
+                "path": path,
+                "role": role_name,
+                "label": label,
+                "x": extents[0] - origin[0],
+                "y": extents[1] - origin[1],
+                "width": extents[2],
+                "height": extents[3],
+                "interactive": interactive,
+            }
+            seen += 1
+            if seen > skip:
+                elements.append(element)
+            text = f"{'  ' * indent}[{element['id']}] {role_name}"
+            if label:
+                text += f" {json.dumps(label, ensure_ascii=False)}"
+            value = value_of(accessible)
+            if value:
+                element["value"] = value
+                text += f" value={json.dumps(value, ensure_ascii=False)}"
+            if seen > skip:
+                lines.append(text)
+            indent += 1
+        if depth >= max_depth:
+            return
+        for index in range(min(child_count, max_children)):
+            try:
+                child = accessible.get_child_at_index(index)
+            except GLib.Error:
+                continue
+            if child is not None:
+                visit(child, depth + 1, indent, [*path, index])
+
+    visit(frame, 0, 0, [])
+    return elements, lines, truncated
+
+
+def collect_screen_elements(desktop, screen_index, max_depth, max_elements, max_children):
+    """Collect elements of every visible window on a screen, dropping those covered by another."""
+    windows = sorted(
+        (
+            item
+            for item in desktop.windows()
+            if item["monitor"] == screen_index and item["on_active_workspace"] and not item["minimized"]
+        ),
+        key=lambda item: -item["stacking"],
+    )
+    deadline = time.monotonic() + SCREEN_ELEMENT_TIME_BUDGET_S
+    elements, lines, covering, next_id = [], [], [], 1
+    truncated = False
+    shell = shell_window()
+    if shell is not None:
+        screen = next((item for item in desktop.monitors() if item["index"] == screen_index), None)
+        found, found_lines, cut = collect_elements(shell, max_depth, max_elements, max_children, deadline, next_id)
+        truncated = truncated or cut
+        next_id += len(found)
+        kept = [
+            (element, line)
+            for element, line in zip(found, found_lines)
+            if screen and contains(screen, element["x"] + element["width"] / 2, element["y"] + element["height"] / 2)
+        ]
+        if kept:
+            lines.append("# GNOME Shell")
+            elements.extend(element for element, _ in kept)
+            lines.extend(line for _, line in kept)
+    for window in windows:
+        found, found_lines, cut = collect_elements(
+            window, max_depth, max_elements - len(elements), max_children, deadline, next_id
+        )
+        truncated = truncated or cut
+        next_id += len(found)
+        kept = [
+            (element, line)
+            for element, line in zip(found, found_lines)
+            if not any(
+                contains(area, window["x"] + element["x"] + element["width"] / 2, window["y"] + element["y"] + element["height"] / 2)
+                for area in covering
+            )
+        ]
+        if kept:
+            lines.append(f"# {window['app'] or window['wm_class']} — {window['title']}")
+            elements.extend(element for element, _ in kept)
+            lines.extend(line for _, line in kept)
+        covering.append(window)
+        if len(elements) >= max_elements or time.monotonic() > deadline:
+            truncated = True
+            break
+    return elements, lines, truncated
+
+
+def shell_window():
+    """A stand-in window for GNOME Shell's own interface, whose coordinates are already global."""
+    if not accessibility_available():
+        return None
+    root = Atspi.get_desktop(0)
+    for index in range(root.get_child_count()):
+        application = root.get_child_at_index(index)
+        if application is not None and application.get_name() == "gnome-shell":
+            return {
+                "id": SHELL_WINDOW_ID, "pid": application.get_process_id(), "title": "", "app": "GNOME Shell",
+                "wm_class": "", "x": 0, "y": 0, "width": 0, "height": 0,
+                "focused": True, "minimized": False, "shadow_x": 0, "shadow_y": 0,
+            }
+    return None
+
+
+def contains(area, x, y):
+    return area["x"] <= x < area["x"] + area["width"] and area["y"] <= y < area["y"] + area["height"]
+
+
+def accessible_at(window, path):
+    node = accessible_frame(window) if accessibility_available() else None
+    for index in path:
+        if node is None:
+            return None
+        node = node.get_child_at_index(index)
+    return node
+
+
+def activate_element(window, element):
+    """Run an element's default action, which needs neither focus nor the pointer."""
+    if element["role"] in NON_ACTIVATABLE_ROLES or "path" not in element:
+        return False
+    try:
+        node = accessible_at(window, element["path"])
+        if node is None or node.get_role_name() != element["role"] or element_label(node, node.get_role()) != element["label"]:
+            return False
+        action = node.get_action_iface()
+        if action is None:
+            return False
+        names = [Atspi.Action.get_action_name(action, index).casefold() for index in range(Atspi.Action.get_n_actions(action))]
+        index = next((names.index(name) for name in PREFERRED_ACTIONS if name in names), None)
+        return index is not None and Atspi.Action.do_action(action, index)
+    except GLib.Error:
+        return False
+
+
+def find_element(snapshot, element_id=None, query=None):
+    elements = snapshot.get("elements") or []
+    if element_id is not None:
+        element = next((item for item in elements if item["id"].casefold() == element_id.casefold()), None)
+        if element is None:
+            raise Fail("ELEMENT_NOT_FOUND", f"Snapshot has no element {element_id}. Call computer_inspect again.")
+        return element
+    wanted = query.casefold()
+    labelled = [item for item in elements if item["label"] and item["role"] != "frame"]
+    fields = [item for item in elements if item.get("value")]
+    # A word inside a field beats a title or heading that merely contains it.
+    for pool, attribute, matches in (
+        (labelled, "label", lambda text: text == wanted),
+        (fields, "value", lambda text: text == wanted),
+        (labelled, "label", lambda text: text.startswith(wanted)),
+        (fields, "value", lambda text: wanted in text),
+        (labelled, "label", lambda text: wanted in text),
+    ):
+        found = [item for item in pool if matches(item[attribute].casefold())]
+        if found:
+            return sorted(found, key=lambda item: not item["interactive"])[0]
+    return None
+
+
+def element_window(desktop, snapshot, element):
+    if "window_id" not in element:
+        return resolve_window(desktop, {}, snapshot)
+    if element["window_id"] == SHELL_WINDOW_ID:
+        return shell_window()
+    window = next((item for item in desktop.windows() if item["id"] == element["window_id"]), None)
+    if window is None:
+        raise Fail("WINDOW_NOT_FOUND", "The observed window is gone. Call computer_observe again.")
+    return window
+
+
+def image_origin(window, snapshot):
+    """Desktop position of a screenshot's top-left pixel; open menus can extend it past the window."""
+    offset_x, offset_y = (snapshot or {}).get("offset", (0, 0))
+    return window["x"] + offset_x, window["y"] + offset_y
+
+
+def element_center(window, element):
+    return window["x"] + element["x"] + element["width"] / 2, window["y"] + element["y"] + element["height"] / 2
+
+
+def element_point(desktop, snapshot, element):
+    window = element_window(desktop, snapshot, element)
+    desktop.focus(window)
+    return element_center(window, element)
+
+
+def request_focus(component):
+    """Ask for focus; GTK4 does not implement the call and raises."""
+    try:
+        return component.grab_focus()
+    except GLib.Error:
+        return False
+
+
+def grab_field_focus(desktop, window, element, query=None):
+    """Focus a text field through accessibility, which needs no screen position.
+
+    When the click named text inside the field, the caret goes to that text.
+    """
+    if element["role"] not in NON_ACTIVATABLE_ROLES or "path" not in element:
+        return False
+    desktop.focus(window)
+    try:
+        node = accessible_at(window, element["path"])
+        component = node.get_component_iface() if node is not None else None
+        if component is None:
+            return False
+        # A field that already has the focus needs nothing more.
+        if not request_focus(component) and not node.get_state_set().contains(Atspi.StateType.FOCUSED):
+            return False
+        content = node.get_text_iface()
+        if query and content is not None:
+            text = Atspi.Text.get_text(content, 0, Atspi.Text.get_character_count(content))
+            position = text.casefold().find(query.casefold())
+            if position >= 0:
+                Atspi.Text.set_caret_offset(content, position)
+        return True
+    except GLib.Error:
+        return False
+
+
+def focused_editable(window):
+    """A window's text field for writing while it is inactive.
+
+    Toolkits drop the focused state from inactive windows, so a lone visible
+    field also counts; with several and no focus the target would be a guess.
+    """
+    frame = accessible_frame(window) if accessibility_available() else None
+    if frame is None:
+        return None
+    deadline = time.monotonic() + FOCUS_SEARCH_BUDGET_S
+    fields = []
+
+    def search(accessible, depth):
+        if depth > OBSERVE_MAX_DEPTH or time.monotonic() > deadline:
+            return None
+        try:
+            states = accessible.get_state_set()
+            if states.contains(Atspi.StateType.EDITABLE) and accessible.get_role() in EDITABLE_ROLES:
+                if states.contains(Atspi.StateType.FOCUSED):
+                    return accessible
+                fields.append(accessible)
+            for index in range(min(accessible.get_child_count(), OBSERVE_MAX_CHILDREN)):
+                child = accessible.get_child_at_index(index)
+                if child is not None and child.get_state_set().contains(Atspi.StateType.SHOWING):
+                    found = search(child, depth + 1)
+                    if found is not None:
+                        return found
+        except GLib.Error:
+            pass
+        return None
+
+    focused = search(frame, 0)
+    return focused if focused is not None else (fields[0] if len(fields) == 1 else None)
+
+
+def insert_without_focus(window, text, clear):
+    """Write straight into a window's focused field; False when it cannot take the text this way."""
+    field = focused_editable(window)
+    if field is None or ("\n" in text and field.get_role() != Atspi.Role.TEXT):
+        return False
+    try:
+        editable, content = field.get_editable_text_iface(), field.get_text_iface()
+        if editable is None or content is None:
+            return False
+        if clear:
+            Atspi.EditableText.delete_text(editable, 0, Atspi.Text.get_character_count(content))
+        before = Atspi.Text.get_character_count(content)
+        caret = Atspi.Text.get_caret_offset(content)
+        Atspi.EditableText.insert_text(editable, caret, text, len(text.encode()))
+        time.sleep(0.05)
+        if Atspi.Text.get_character_count(content) == before:
+            return False
+        Atspi.Text.set_caret_offset(content, caret + len(text))
+    except GLib.Error:
+        return False
+    return True
+
+
+@contextmanager
+def borrowed_focus(desktop, window, options, restore_pointer=False):
+    """Focus a window for one action, then hand focus and pointer back to the user."""
+    keep = bool(options.get("--foreground"))
+    previous = None
+    if window is not None and not window["focused"]:
+        previous = next((item for item in desktop.windows() if item["focused"]), None)
+    pointer = desktop.pointer_position() if restore_pointer and not keep else None
+    was_minimized = window is not None and window["minimized"]
+    if window is not None:
+        desktop.focus(window)
+    try:
+        yield
+    finally:
+        time.sleep(0.1)
+        if not keep:
+            if was_minimized:
+                desktop.window_action(window["id"], "minimize")
+            if previous is not None:
+                desktop.focus({**previous, "focused": False})
+            if pointer is not None:
+                desktop.pointer_warp(*pointer)
+
+
+def target_window(desktop, options):
+    if "--app" in options or "--window-id" in options or "--snapshot" in options:
+        return resolve_window(desktop, options, optional_snapshot(options))
+    return None
+
+
+def point_exposed(desktop, window, x, y):
+    """True when no other window covers a desktop point on this window."""
+    if window["minimized"]:
+        return False
+    return not any(
+        item["stacking"] > window["stacking"]
+        and item["on_active_workspace"]
+        and not item["minimized"]
+        and contains(item, x, y)
+        for item in desktop.windows()
+    )
+
+
+# ------------------------------------------------------------------ screenshots
+
+
+def to_logical_size(path, bounds):
+    """Scale HiDPI captures down so one image pixel is one logical desktop pixel."""
+    pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+    if pixbuf.get_width() == bounds["width"] and pixbuf.get_height() == bounds["height"]:
+        return
+    scaled = pixbuf.scale_simple(bounds["width"], bounds["height"], GdkPixbuf.InterpType.BILINEAR)
+    scaled.savev(path, "png", [], [])
+
+
+def parse_ocr(tsv):
+    """Group Tesseract's word rows into text lines with their word boxes."""
+    lines = {}
+    for row in tsv.splitlines()[1:]:
+        fields = row.split("\t")
+        if len(fields) < 12 or fields[0] != "5" or float(fields[10]) < OCR_MIN_CONFIDENCE or not fields[11].strip():
+            continue
+        left, top, width, height = (int(value) for value in fields[6:10])
+        word = {"text": fields[11].strip(), "x": left, "y": top, "width": width, "height": height}
+        lines.setdefault(tuple(fields[2:5]), []).append(word)
+    return [
+        {"label": " ".join(word["text"] for word in words), **bounding_box(words), "words": words}
+        for words in lines.values()
+    ]
+
+
+def bounding_box(boxes):
+    left = min(box["x"] for box in boxes)
+    top = min(box["y"] for box in boxes)
+    return {
+        "x": left,
+        "y": top,
+        "width": max(box["x"] + box["width"] for box in boxes) - left,
+        "height": max(box["y"] + box["height"] for box in boxes) - top,
+    }
+
+
+def read_text(path):
+    """OCR an image; an empty result when Tesseract is missing or fails."""
+    if shutil.which("tesseract") is None:
+        return []
+    try:
+        result = subprocess.run(
+            ["tesseract", path, "stdout", "-l", "por+eng", "--psm", "11", "tsv"],
+            capture_output=True, text=True, timeout=OCR_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return parse_ocr(result.stdout) if result.returncode == 0 else []
+
+
+def ocr_elements(window, path, offset, first_id):
+    """Elements read from pixels, for windows with no accessibility tree."""
+    elements = []
+    for index, line in enumerate(read_text(path)):
+        shifted = [{**word, "x": word["x"] + offset[0], "y": word["y"] + offset[1]} for word in line["words"]]
+        elements.append({
+            "id": f"E{first_id + index}", "window_id": window["id"], "role": "ocr text", "label": line["label"],
+            "interactive": True, "words": shifted, **bounding_box(shifted),
+        })
+    return elements
+
+
+def narrow_to_words(element, query):
+    """Aim at the words a query names inside a longer OCR line."""
+    words = element.get("words") or []
+    wanted = query.casefold()
+    for length in range(1, len(words) + 1):
+        for start in range(len(words) - length + 1):
+            span = words[start : start + length]
+            if wanted in " ".join(word["text"] for word in span).casefold():
+                return {**element, **bounding_box(span)}
+    return element
+
+
+def ocr_search(desktop, snapshot, query):
+    """Look for text on screen in a window whose accessibility tree does not have it."""
+    if snapshot.get("window_id") is None or shutil.which("tesseract") is None:
+        return None
+    window = element_window(desktop, snapshot, {"window_id": snapshot["window_id"]})
+    capture = os.path.join(snapshot_directory(), f"ocr-{secrets.token_hex(4)}.png")
+    try:
+        bounds = desktop.screenshot("window", window["id"], capture)
+        to_logical_size(capture, bounds)
+        elements = ocr_elements(window, capture, (bounds["x"] - window["x"], bounds["y"] - window["y"]), 1)
+    finally:
+        if os.path.exists(capture):
+            os.unlink(capture)
+    found = find_element({"elements": elements}, query=query)
+    return narrow_to_words(found, query) if found else None
+
+
+def annotate(source, destination, elements):
+    import cairo
+
+    surface = cairo.ImageSurface.create_from_png(source)
+    context = cairo.Context(surface)
+    context.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    context.set_font_size(11)
+    for element in elements:
+        if not element["interactive"]:
+            continue
+        x, y, width, height = element["image_x"], element["image_y"], element["width"], element["height"]
+        context.set_source_rgba(0.95, 0.1, 0.35, 0.9)
+        context.set_line_width(1.5)
+        context.rectangle(x + 0.5, y + 0.5, width, height)
+        context.stroke()
+        extents = context.text_extents(element["id"])
+        context.rectangle(x, y, extents.width + 6, 14)
+        context.fill()
+        context.set_source_rgb(1, 1, 1)
+        context.move_to(x + 3, y + 11)
+        context.show_text(element["id"])
+    surface.write_to_png(destination)
+
+
+# --------------------------------------------------------------------- commands
+
+
+def command_see(desktop, positional, options):
+    snapshot_id = f"S{secrets.token_hex(4)}"
+    tree = bool(options.get("--tree"))
+    capture = not options.get("--no-screenshot")
+    path = options.get("--path") or os.path.join(snapshot_directory(), f"{snapshot_id}.png")
+
+    # With no target the desktop is the useful answer: the focused window is usually the chat itself.
+    if options.get("--mode") in ("screen", "frontmost"):
+        primary = next((item["index"] for item in desktop.monitors() if item["primary"]), 0)
+        screen_index = integer(options, "--screen-index", primary)
+        monitor = next((item for item in desktop.monitors() if item["index"] == screen_index), None)
+        if monitor is None:
+            raise Fail("SCREEN_NOT_FOUND", f"No screen has index {screen_index}.")
+        bounds = bounds_of(monitor)
+        if capture:
+            desktop.screenshot("screen", screen_index, path)
+            to_logical_size(path, bounds)
+        elements, lines, truncated = [], [], False
+        if tree or not options.get("--no-elements"):
+            elements, lines, truncated = collect_screen_elements(
+                desktop,
+                screen_index,
+                integer(options, "--depth", OBSERVE_MAX_DEPTH),
+                integer(options, "--max-elements", OBSERVE_MAX_ELEMENTS),
+                integer(options, "--max-children", OBSERVE_MAX_CHILDREN),
+            )
+        origins = {item["id"]: item for item in desktop.windows()}
+        for element in elements:
+            window = origins.get(element["window_id"], bounds)
+            element["image_x"] = window["x"] - bounds["x"] + element["x"]
+            element["image_y"] = window["y"] - bounds["y"] + element["y"]
+        snapshot = {"id": snapshot_id, "kind": "screen", "screen_index": screen_index, "bounds": bounds, "elements": elements}
+        save_snapshot(snapshot)
+        data = {
+            "snapshot_id": snapshot_id,
+            "capture_mode": "screen",
+            "element_count": len(elements),
+            "interactable_count": sum(1 for element in elements if element["interactive"]),
+            "observation": {"target": {"resolved_kind": "screen", "bounds": bounds}},
+        }
+        if truncated:
+            data["truncated"] = True
+        if capture:
+            data["screenshot_raw"] = path
+            if options.get("--annotate") and elements:
+                annotated = path.removesuffix(".png") + "-annotated.png"
+                annotate(path, annotated, elements)
+                data["screenshot_annotated"] = annotated
+        if tree:
+            data["text"] = "\n".join(lines) or "No accessible elements were exposed on this screen."
+        return data, f"Observed screen {screen_index}."
+
+    window = resolve_window(desktop, options)
+    if not window["minimized"]:
+        return observe_window(desktop, window, options, snapshot_id, tree, capture, path)
+    # A minimized window has nothing to paint, so show it just long enough to observe it.
+    desktop.window_action(window["id"], "restore")
+    time.sleep(MINIMIZED_RESTORE_WAIT_S)
+    try:
+        current = next(item for item in desktop.windows() if item["id"] == window["id"])
+        return observe_window(desktop, current, options, snapshot_id, tree, capture, path)
+    finally:
+        desktop.window_action(window["id"], "minimize")
+
+
+def observe_window(desktop, window, options, snapshot_id, tree, capture, path):
+    bounds = bounds_of(window)
+    if capture:
+        bounds = desktop.screenshot("window", window["id"], path)
+        to_logical_size(path, bounds)
+
+    elements, lines, truncated = [], [], False
+    skip = integer(options, "--skip", 0)
+    if tree:
+        elements, lines, truncated = collect_elements(
+            window,
+            integer(options, "--depth", 8),
+            integer(options, "--max-elements", 100),
+            integer(options, "--max-children", 25),
+            time.monotonic() + TREE_ELEMENT_TIME_BUDGET_S,
+            skip=skip,
+        )
+    elif not options.get("--no-elements"):
+        elements, lines, truncated = collect_elements(
+            window, OBSERVE_MAX_DEPTH, OBSERVE_MAX_ELEMENTS, OBSERVE_MAX_CHILDREN
+        )
+
+    offset = (bounds["x"] - window["x"], bounds["y"] - window["y"])
+    if not options.get("--no-elements") and not any(element["interactive"] for element in elements):
+        image = path if capture else os.path.join(snapshot_directory(), f"ocr-{snapshot_id}.png")
+        try:
+            if not capture:
+                bounds = desktop.screenshot("window", window["id"], image)
+                to_logical_size(image, bounds)
+                offset = (bounds["x"] - window["x"], bounds["y"] - window["y"])
+            read = ocr_elements(window, image, offset, len(elements) + 1)
+        finally:
+            if not capture and os.path.exists(image):
+                os.unlink(image)
+        elements.extend(read)
+        lines.extend(f"[{element['id']}] ocr text {json.dumps(element['label'], ensure_ascii=False)}" for element in read)
+    for element in elements:
+        element["image_x"] = element["x"] - offset[0]
+        element["image_y"] = element["y"] - offset[1]
+    snapshot = {
+        "id": snapshot_id,
+        "kind": "window",
+        "window_id": window["id"],
+        "bounds": bounds,
+        "offset": offset,
+        "elements": elements,
+    }
+    save_snapshot(snapshot)
+    application = window["app"] or window["wm_class"]
+    data = {
+        "snapshot_id": snapshot_id,
+        "application_name": application,
+        "window_title": window["title"],
+        "capture_mode": "window",
+        "element_count": len(elements),
+        "interactable_count": sum(1 for element in elements if element["interactive"]),
+        "observation": {
+            "target": {"resolved_kind": "window-id", "window_id": window["id"], "bounds": bounds}
+        },
+    }
+    if capture:
+        data["screenshot_raw"] = path
+        if options.get("--annotate") and elements:
+            annotated = path.removesuffix(".png") + "-annotated.png"
+            annotate(path, annotated, elements)
+            data["screenshot_annotated"] = annotated
+    if truncated:
+        data["truncated"] = True
+    if tree:
+        data["text"] = "\n".join(lines) or (
+            "No accessible elements were exposed by this window. Use coordinates from computer_observe instead."
+        )
+        if truncated:
+            data["text"] += f"\n... more elements exist; call computer_inspect with offset={skip + len(elements)}."
+    return data, f"Observed {application} — {window['title']}."
+
+
+def command_click(desktop, positional, options):
+    snapshot = optional_snapshot(options)
+    button = BUTTONS["right"] if options.get("--right") else BUTTONS["middle"] if options.get("--middle") else BUTTONS["left"]
+    count = 3 if options.get("--triple") else 2 if options.get("--double") else 1
+    hold = 0.8 if options.get("--long-press") else 0.0
+
+    if "--at" in options:
+        desktop.ensure_input_available()
+        x, y = point(options, "--at")
+        if not options.get("--global"):
+            window = resolve_window(desktop, options, snapshot)
+            desktop.focus(window)
+            origin_x, origin_y = image_origin(window, snapshot)
+            x, y = origin_x + x, origin_y + y
+        target = f"({round(x)}, {round(y)})"
+    else:
+        if snapshot is None:
+            raise Fail("SNAPSHOT_TARGET_MISSING", "Element and text clicks require a snapshot ID.")
+        if "--on" in options:
+            element = find_element(snapshot, element_id=options["--on"])
+        else:
+            if not positional:
+                raise Fail("INVALID_TARGET", "Supply an element ID, visible text, or coordinates.")
+            element = wait_for_query(desktop, snapshot, positional[0], integer(options, "--wait-for", 0))
+        if element.get("window_id") != SHELL_WINDOW_ID:
+            desktop.ensure_input_available()
+        target = f"{element['role']} {element['label']!r}".strip()
+        plain_click = button == BUTTONS["left"] and count == 1 and not hold
+        if plain_click and not options.get("--foreground"):
+            window = element_window(desktop, snapshot, element)
+            if activate_element(window, element):
+                return {"clicked": target, "via": "accessibility"}, f"Activated {target}."
+            if grab_field_focus(desktop, window, element, positional[0] if positional else None):
+                return {"clicked": target, "via": "accessibility"}, f"Focused {target}."
+        x, y = element_point(desktop, snapshot, element)
+
+    desktop.click(x, y, button, count, hold)
+    return {"clicked": target, "x": round(x), "y": round(y)}, f"Clicked {target}."
+
+
+def wait_for_query(desktop, snapshot, query, wait_ms):
+    deadline = time.monotonic() + wait_ms / 1000
+    while True:
+        if not snapshot.get("elements") and snapshot.get("window_id") is not None:
+            window = resolve_window(desktop, {}, snapshot)
+            snapshot["elements"], _, _ = collect_elements(
+                window, OBSERVE_MAX_DEPTH, OBSERVE_MAX_ELEMENTS, OBSERVE_MAX_CHILDREN
+            )
+        element = find_element(snapshot, query=query)
+        if element is not None:
+            return narrow_to_words(element, query)
+        if time.monotonic() >= deadline:
+            element = ocr_search(desktop, snapshot, query)
+            if element is not None:
+                return element
+            raise Fail(
+                "ELEMENT_NOT_FOUND",
+                f"No accessible element is labelled {query!r}. Use computer_inspect, or click coordinates from the screenshot.",
+            )
+        time.sleep(0.25)
+        snapshot["elements"] = []
+
+
+class Keyboard:
+    """Turns characters into key presses for the active layout.
+
+    Mutter's keyval injection applies Shift and AltGr itself but stops at level 2,
+    so symbols on Shift+AltGr (quotes and tilde on us-intl) need those held by hand.
+    """
+
+    def __init__(self, desktop):
+        self.desktop = desktop
+        self.group = desktop.keyboard_group()
+        display = Gdk.Display.get_default()
+        if display is None:
+            raise Fail("DISPLAY_UNAVAILABLE", "The desktop keyboard layout could not be read.")
+        # Wayland delivers the keymap asynchronously, after the first roundtrip.
+        display.sync()
+        context = GLib.MainContext.default()
+        while context.pending():
+            context.iteration(False)
+        display.sync()
+        self.keymap = Gdk.Keymap.get_for_display(display)
+
+    def level(self, keyval):
+        found, keys = self.keymap.get_entries_for_keyval(keyval)
+        levels = [key.level for key in keys if key.group == self.group] if found else []
+        return min(levels, default=None)
+
+    def plan(self, character):
+        """Return (keyval, modifiers to hold), or None when no key produces the character."""
+        if character == "\n":
+            return KEYSYMS["return"], []
+        if character == "\t":
+            return KEYSYMS["tab"], []
+        keyval = Gdk.unicode_to_keyval(ord(character))
+        level = self.level(keyval)
+        if level is None or level > 3:
+            return None
+        if level < 3:
+            return keyval, []
+        return (keyval, [KEYSYM_SHIFT, KEYSYM_LEVEL3]) if self.level(KEYSYM_LEVEL3) is not None else None
+
+    def press(self, keyval, modifiers):
+        for modifier in modifiers:
+            self.desktop.key(modifier, True)
+        self.desktop.tap(keyval)
+        for modifier in reversed(modifiers):
+            self.desktop.key(modifier, False)
+
+
+def command_type(desktop, positional, options):
+    text = options.get("--text")
+    if not isinstance(text, str) or not text:
+        raise Fail("INVALID_ARGUMENTS", "--text is required.")
+    desktop.ensure_input_available()
+    window = target_window(desktop, options)
+    clear = bool(options.get("--clear"))
+    if window is not None and not window["focused"] and not options.get("--foreground"):
+        if insert_without_focus(window, text, clear):
+            return {"typed_characters": len(text), "via": "accessibility"}, f"Typed {len(text)} characters."
+    receiver = window or next((item for item in desktop.windows() if item["focused"]), None)
+    field = focused_editable(receiver) if receiver is not None else None
+    before = field_length(field) if field is not None else None
+    with borrowed_focus(desktop, window, options):
+        result = type_with_keys(desktop, text, clear, integer(options, "--delay", 6) / 1000)
+        time.sleep(0.05)
+        if receiver is not None and not next(
+            (item["focused"] for item in desktop.windows() if item["id"] == receiver["id"]), False
+        ):
+            raise Fail("FOCUS_LOST", "Another window took the focus while typing. Check the text and retry.")
+    confirm_delivery(field, before, text, clear)
+    return result
+
+
+def field_length(field):
+    try:
+        return Atspi.Text.get_character_count(field.get_text_iface())
+    except (GLib.Error, TypeError, AttributeError):
+        return None
+
+
+def confirm_delivery(field, before, text, clear):
+    """Fail when a field the text should have reached did not change."""
+    # Clearing and submitting legitimately change the length in ways that cannot be predicted.
+    if field is None or before is None or clear or "\n" in text:
+        return
+    deadline = time.monotonic() + DELIVERY_CONFIRM_BUDGET_S
+    while time.monotonic() < deadline:
+        if field_length(field) != before:
+            return
+        time.sleep(0.1)
+    raise Fail(
+        "INPUT_NOT_DELIVERED",
+        "The text did not reach the field. Something else may have taken the focus; observe the window and retry.",
+    )
+
+
+def type_with_keys(desktop, text, clear, delay):
+    if clear:
+        desktop.chord([KEYSYMS["ctrl"], ord("a")])
+        desktop.tap(KEYSYMS["backspace"])
+
+    # Characters the layout has no key for go through the input method, or the
+    # clipboard for apps that do not use one.
+    keyboard = Keyboard(desktop)
+    pasted = False
+    run = ""
+    for character in [*text, None]:
+        plan = keyboard.plan(character) if character is not None else None
+        if character is not None and plan is None:
+            run += character
+            continue
+        if run:
+            if desktop.commit_text(run):
+                time.sleep(0.05)
+            else:
+                desktop.set_clipboard(run)
+                time.sleep(0.05)
+                desktop.chord([KEYSYMS["ctrl"], ord("v")])
+                time.sleep(0.15)
+                pasted = True
+            run = ""
+        if character is not None:
+            keyboard.press(*plan)
+            time.sleep(delay)
+    data = {"typed_characters": len(text)}
+    if pasted:
+        data["note"] = "Non-ASCII text was pasted with Ctrl+V and replaced the clipboard."
+    return data, f"Typed {len(text)} characters."
+
+
+def keysyms_for_token(token):
+    keys = []
+    for part in token.split("+"):
+        name = part.strip().casefold()
+        if name in KEYSYMS:
+            keys.append(KEYSYMS[name])
+        elif len(name) == 1 and 0x20 <= ord(name) <= 0x7E:
+            keys.append(ord(name))
+        else:
+            raise Fail("INVALID_KEY", f"Unknown key {part!r}.")
+    return keys
+
+
+def command_press(desktop, positional, options):
+    if not positional:
+        raise Fail("INVALID_ARGUMENTS", "Supply at least one key.")
+    chords = [keysyms_for_token(token) for token in positional]
+    desktop.ensure_input_available()
+    with borrowed_focus(desktop, target_window(desktop, options), options):
+        for _ in range(integer(options, "--count", 1)):
+            for chord in chords:
+                desktop.chord(chord)
+                time.sleep(0.04)
+    return {"keys": positional}, f"Pressed {' '.join(positional)}."
+
+
+def command_scroll(desktop, positional, options):
+    direction = options.get("--direction")
+    if direction not in ("up", "down", "left", "right"):
+        raise Fail("INVALID_ARGUMENTS", "--direction must be up, down, left, or right.")
+    amount = integer(options, "--amount", 3)
+    snapshot = optional_snapshot(options)
+    desktop.ensure_input_available()
+    def scroll():
+        time.sleep(0.05)
+        if options.get("--smooth"):
+            scroll_smoothly(desktop, direction, amount)
+        else:
+            desktop.scroll(direction, amount)
+
+    if "--on" in options:
+        if snapshot is None:
+            raise Fail("SNAPSHOT_TARGET_MISSING", "Element scrolling requires a snapshot ID.")
+        element = find_element(snapshot, element_id=options["--on"])
+        window = element_window(desktop, snapshot, element)
+        x, y = element_center(window, element)
+    elif "--at" in options:
+        window = resolve_window(desktop, options, snapshot)
+        x, y = point(options, "--at")
+        origin_x, origin_y = image_origin(window, snapshot)
+        x, y = origin_x + x, origin_y + y
+    else:
+        scroll()
+        return {"direction": direction, "amount": amount}, f"Scrolled {direction} {amount}."
+
+    # Scroll events follow the pointer, so a visible window scrolls without taking focus.
+    needs_focus = not point_exposed(desktop, window, x, y)
+    with borrowed_focus(desktop, window if needs_focus else None, options, restore_pointer=True):
+        desktop.pointer_move(x, y)
+        scroll()
+    return {"direction": direction, "amount": amount}, f"Scrolled {direction} {amount}."
+
+
+def scroll_smoothly(desktop, direction, amount):
+    unit_x, unit_y = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}[direction]
+    frames = amount * SMOOTH_SCROLL_FRAMES
+    delta = SMOOTH_SCROLL_DISTANCE / SMOOTH_SCROLL_FRAMES
+    for frame in range(frames):
+        desktop.scroll_continuous(unit_x * delta, unit_y * delta, False)
+        time.sleep(0.016)
+    desktop.scroll_continuous(0, 0, True)
+
+
+def command_move(desktop, positional, options):
+    """Send relative motion, the only pointer input a game with a captured mouse reads."""
+    desktop.ensure_input_available()
+    window = target_window(desktop, options)
+    if window is not None:
+        desktop.focus(window)
+    dx, dy = integer(options, "--dx", 0), integer(options, "--dy", 0)
+    steps = max(1, integer(options, "--steps", 12))
+    pause = integer(options, "--duration", 200) / 1000 / steps
+    for _ in range(steps):
+        desktop.pointer_relative(dx / steps, dy / steps)
+        time.sleep(pause)
+    return {"dx": dx, "dy": dy}, f"Moved pointer by ({dx}, {dy})."
+
+
+def command_hold(desktop, positional, options):
+    """Press and keep keys or mouse buttons down, as games need."""
+    action = options.get("--action", "tap")
+    if action == "release":
+        desktop.call("ReleaseHeld")
+        return {"released": True}, "Released all held input."
+    if action not in ("down", "up", "tap"):
+        raise Fail("INVALID_ARGUMENTS", "--action must be down, up, tap, or release.")
+    desktop.ensure_input_available()
+    inputs = [("key", keyval) for keyval in keysyms_for_token(options["--keys"])] if "--keys" in options else []
+    if "--button" in options:
+        if options["--button"] not in BUTTONS:
+            raise Fail("INVALID_ARGUMENTS", "--button must be left, right, or middle.")
+        inputs.append(("button", BUTTONS[options["--button"]]))
+    if not inputs:
+        raise Fail("INVALID_ARGUMENTS", "Supply keys, a button, or both.")
+    window = target_window(desktop, options)
+    if window is not None:
+        desktop.focus(window)
+    if action != "up":
+        for kind, code in inputs:
+            desktop.hold(kind, code, True)
+    if action == "tap":
+        time.sleep(integer(options, "--duration", 200) / 1000)
+    if action != "down":
+        for kind, code in reversed(inputs):
+            desktop.hold(kind, code, False)
+    return {"action": action, "held": len(inputs)}, f"Hold {action} completed."
+
+
+def command_clipboard(desktop, positional, options):
+    action = positional[0] if positional else ""
+    if action == "get":
+        text = desktop.get_clipboard()
+        return {"text": text}, text
+    if action == "set" and isinstance(options.get("--text"), str):
+        desktop.set_clipboard(options["--text"])
+        return {"length": len(options["--text"])}, "Clipboard updated."
+    raise Fail("INVALID_ARGUMENTS", "Use clipboard get, or clipboard set --text.")
+
+
+def command_drag(desktop, positional, options):
+    desktop.ensure_input_available()
+    snapshot = optional_snapshot(options)
+    if options.get("--global"):
+        if snapshot is None or snapshot.get("kind") != "screen":
+            raise Fail("EXACT_WINDOW_REQUIRED", "Global dragging requires a screen observation.")
+        drag_pointer(desktop, options, None, snapshot["bounds"]["x"], snapshot["bounds"]["y"])
+        return {"from": list(point(options, "--from")), "to": list(point(options, "--to"))}, "Drag completed."
+    window = resolve_window(desktop, options, snapshot)
+    origin_x, origin_y = image_origin(window, snapshot)
+    drag_pointer(desktop, options, window, origin_x, origin_y)
+    return {"from": list(point(options, "--from")), "to": list(point(options, "--to"))}, "Drag completed."
+
+
+def drag_pointer(desktop, options, window, origin_x, origin_y):
+    start, end = point(options, "--from"), point(options, "--to")
+    steps = integer(options, "--steps", 20)
+    duration = integer(options, "--duration", 500) / 1000
+    with borrowed_focus(desktop, window, options, restore_pointer=True):
+        desktop.pointer_move(origin_x + start[0], origin_y + start[1])
+        time.sleep(0.05)
+        desktop.pointer_button(BUTTONS["left"], True)
+        try:
+            for step in range(1, steps + 1):
+                fraction = step / steps
+                desktop.pointer_move(
+                    origin_x + start[0] + (end[0] - start[0]) * fraction,
+                    origin_y + start[1] + (end[1] - start[1]) * fraction,
+                )
+                time.sleep(duration / steps)
+        finally:
+            desktop.pointer_button(BUTTONS["left"], False)
+
+
+def find_application(name):
+    wanted = name.casefold()
+    applications = [info for info in Gio.AppInfo.get_all() if info.should_show()]
+
+    def names(info):
+        identifier = info.get_id() or ""
+        executable = os.path.basename(info.get_executable() or "")
+        return [
+            value.casefold()
+            for value in (identifier, identifier.removesuffix(".desktop"), info.get_name(), info.get_display_name(), executable)
+            if value
+        ]
+
+    for matches in (lambda candidate: wanted in names(candidate), lambda candidate: any(wanted in value for value in names(candidate))):
+        found = [info for info in applications if matches(info)]
+        if found:
+            return found[0]
+    raise Fail("APP_NOT_FOUND", f"No installed application matches {name!r}.")
+
+
+def launch_application(desktop, name, items):
+    info = find_application(name)
+    known = {item["id"] for item in desktop.windows()}
+    uris = [item if "://" in item else Gio.File.new_for_path(os.path.abspath(item)).get_uri() for item in items]
+    desktop.call("LaunchApp", GLib.Variant("(sas)", (info.get_id() or "", uris)))
+    identifier = (info.get_id() or "").casefold()
+    deadline = time.monotonic() + APP_LAUNCH_TIMEOUT_S
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        windows = desktop.windows()
+        fresh = [item for item in windows if item["id"] not in known]
+        mine = [item for item in windows if item["app_id"].casefold() == identifier]
+        target = next(iter(front_first([item for item in fresh if item in mine] or fresh or (mine if not uris else []))), None)
+        if target is not None:
+            desktop.focus(target)
+            return info, target
+    raise Fail("APP_LAUNCH_TIMEOUT", f"{info.get_name()} started but opened no window within {APP_LAUNCH_TIMEOUT_S} seconds.")
+
+
+def quit_application(desktop, app, force):
+    windows = app_windows(desktop.windows(), app)
+    if not windows:
+        raise Fail("APP_NOT_FOUND", f"No running application matches {app!r}.")
+    if force:
+        for pid in {item["pid"] for item in windows}:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    else:
+        for window in windows:
+            desktop.window_action(window["id"], "close")
+    deadline = time.monotonic() + 5
+    ids = {item["id"] for item in windows}
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        if not any(item["id"] in ids for item in desktop.windows()):
+            return windows, True
+    return windows, False
+
+
+def background_applications(known_pids):
+    """Applications registered with AT-SPI that have no window."""
+    if not accessibility_available():
+        return []
+    root = Atspi.get_desktop(0)
+    found = {}
+    for index in range(root.get_child_count()):
+        try:
+            application = root.get_child_at_index(index)
+            pid = application.get_process_id() if application is not None else 0
+            if pid and pid not in known_pids and application.get_name():
+                found[pid] = {
+                    "name": application.get_name(), "desktop_id": "", "pid": pid, "window_count": 0,
+                    "is_active": False, "is_hidden": False, "is_background": True,
+                }
+        except GLib.Error:
+            continue
+    return list(found.values())
+
+
+def command_app(desktop, positional, options):
+    action = positional[0] if positional else ""
+    windows = desktop.windows()
+    if action == "list":
+        applications = {}
+        for window in windows:
+            key = window["app_id"] or window["wm_class"] or f"PID:{window['pid']}"
+            entry = applications.setdefault(
+                key,
+                {"name": window["app"] or window["wm_class"], "desktop_id": window["app_id"], "pid": window["pid"],
+                 "window_count": 0, "is_active": False, "is_hidden": True},
+            )
+            entry["window_count"] += 1
+            entry["is_active"] = entry["is_active"] or window["focused"]
+            entry["is_hidden"] = entry["is_hidden"] and window["minimized"]
+        listed = [entry for entry in applications.values() if options.get("--include-hidden") or not entry["is_hidden"]]
+        if options.get("--include-background"):
+            listed.extend(background_applications({window["pid"] for window in windows}))
+        lines = [
+            f"{entry['name']} (PID:{entry['pid']}, {entry['window_count']} window(s))"
+            f"{' [active]' if entry['is_active'] else ''}{' [hidden]' if entry['is_hidden'] else ''}"
+            f"{' [background]' if entry.get('is_background') else ''}"
+            for entry in listed
+        ]
+        return {"applications": listed}, "\n".join(lines) or "No applications have open windows."
+    if action == "launch":
+        name = positional[1] if len(positional) > 1 else None
+        if not name:
+            raise Fail("INVALID_ARGUMENTS", "app launch requires an application name.")
+        items = options.get("--open", [])
+        running = app_windows(windows, name)
+        if running and not items:
+            desktop.focus(running[0])
+            return {"app": running[0]["app"], "window": window_view(running[0])}, f"{running[0]['app']} is already running; focused it."
+        info, window = launch_application(desktop, name, items)
+        return {"app": info.get_name(), "window": window_view(window)}, f"Launched {info.get_name()}."
+    if action == "switch":
+        candidates = app_windows(windows, options.get("--to", ""))
+        if not candidates:
+            raise Fail("APP_NOT_FOUND", f"No running application matches {options.get('--to')!r}.")
+        desktop.focus(candidates[0])
+        return {"window": window_view(candidates[0])}, f"Switched to {candidates[0]['app']}."
+    if action == "quit":
+        closed, gone = quit_application(desktop, options.get("--app", ""), bool(options.get("--force")))
+        summary = f"Quit {closed[0]['app']}." if gone else f"Asked {closed[0]['app']} to close; some windows are still open (unsaved changes?)."
+        return {"app": closed[0]["app"], "quit": gone}, summary
+    if action == "relaunch":
+        name = positional[1] if len(positional) > 1 else ""
+        if app_windows(windows, name):
+            _, gone = quit_application(desktop, name, bool(options.get("--force")))
+            if not gone:
+                raise Fail("APP_QUIT_FAILED", f"{name} did not close; retry with force=true.")
+        info, window = launch_application(desktop, name, [])
+        return {"app": info.get_name(), "window": window_view(window)}, f"Relaunched {info.get_name()}."
+    if action in ("hide", "unhide"):
+        candidates = app_windows(windows, options.get("--app", ""))
+        if not candidates:
+            raise Fail("APP_NOT_FOUND", f"No running application matches {options.get('--app')!r}.")
+        for window in candidates:
+            desktop.window_action(window["id"], "minimize" if action == "hide" else "restore")
+        if action == "unhide":
+            desktop.window_action(candidates[0]["id"], "focus")
+        return {"app": candidates[0]["app"]}, f"Application {action} completed."
+    raise Fail("INVALID_ARGUMENTS", f"Unknown app action {action!r}.")
+
+
+def command_window(desktop, positional, options):
+    action = positional[0] if positional else ""
+    if action == "list":
+        candidates = app_windows(desktop.windows(), options.get("--app", ""))
+        if not candidates:
+            raise Fail("APP_NOT_FOUND", f"No open window matches app {options.get('--app')!r}.")
+        views = [window_view(window) for window in candidates]
+        lines = [
+            f"window_id={view['window_id']} {json.dumps(view['title'], ensure_ascii=False)} "
+            f"{view['bounds']['width']}x{view['bounds']['height']} at ({view['bounds']['x']}, {view['bounds']['y']})"
+            f"{' [focused]' if view['is_focused'] else ''}{' [minimized]' if view['is_minimized'] else ''}"
+            for view in views
+        ]
+        return {"windows": views}, "\n".join(lines)
+
+    window = resolve_window(desktop, options)
+    if action == "place":
+        if "--screen" in options:
+            desktop.window_action(window["id"], "move_monitor", [integer(options, "--screen")])
+        if "--workspace" in options:
+            desktop.window_action(window["id"], "move_workspace", [integer(options, "--workspace")])
+        time.sleep(0.15)
+        current = next(item for item in desktop.windows() if item["id"] == window["id"])
+        return {"window": window_view(current)}, f"Placed {window['app']} on screen {current['monitor']}, workspace {current['workspace']}."
+    action = action.replace("-", "_")
+    geometry = {
+        "move": ("--x", "--y"),
+        "resize": ("--width", "--height"),
+        "set_bounds": ("--x", "--y", "--width", "--height"),
+    }.get(action, ())
+    if action == "focus":
+        desktop.focus(window)
+    elif action in ("close", "minimize", "restore", "maximize", "move", "resize", "set_bounds"):
+        desktop.window_action(window["id"], action, [integer(options, name, 0) for name in geometry])
+        time.sleep(0.15)
+    else:
+        raise Fail("INVALID_ARGUMENTS", f"Unknown window action {action!r}.")
+    current = next((item for item in desktop.windows() if item["id"] == window["id"]), None)
+    data = {"window": window_view(current)} if current else {"window_id": window["id"], "closed": True}
+    return data, f"Window {action} completed for {window['app']} — {window['title']}."
+
+
+def command_screen(desktop, positional, options):
+    monitors = desktop.monitors()
+    screens = [
+        {"index": monitor["index"], "bounds": bounds_of(monitor), "scale": monitor["scale"], "is_primary": monitor["primary"]}
+        for monitor in monitors
+    ]
+    lines = [
+        f"screen_index={screen['index']} {screen['bounds']['width']}x{screen['bounds']['height']} "
+        f"at ({screen['bounds']['x']}, {screen['bounds']['y']}){' [primary]' if screen['is_primary'] else ''}"
+        for screen in screens
+    ]
+    primary = next((screen["index"] for screen in screens if screen["is_primary"]), 0)
+    return {"screens": screens, "primaryIndex": primary}, "\n".join(lines)
+
+
+def command_permissions():
+    status = {"session_type": os.environ.get("XDG_SESSION_TYPE", "unknown")}
+    try:
+        Desktop()
+        status["desktop_extension"] = "ready"
+    except Fail as failure:
+        status["desktop_extension"] = failure.code
+    status["accessibility"] = "ready" if accessibility_available() else "unavailable"
+    lines = [f"{name}: {value}" for name, value in status.items()]
+    if status["desktop_extension"] != "ready":
+        lines.append("Run /computer-claude:setup in Claude Code, then log out and back in.")
+    return status, "\n".join(lines)
+
+
+JPEG_QUALITIES = (85, 65, 55, 45, 35)
+
+
+def command_jpeg(positional):
+    """Re-encode a capture as the largest JPEG that fits the byte budget."""
+    try:
+        source, destination, budget = positional[0], positional[1], int(positional[2])
+    except (IndexError, ValueError):
+        raise Fail("INVALID_ARGUMENTS", "Usage: jpeg <source> <destination> <max-bytes>.") from None
+    pixbuf = GdkPixbuf.Pixbuf.new_from_file(source)
+    if pixbuf.get_has_alpha():
+        width, height = pixbuf.get_width(), pixbuf.get_height()
+        opaque = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, width, height)
+        opaque.fill(0xFFFFFFFF)
+        pixbuf.composite(opaque, 0, 0, width, height, 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
+        pixbuf = opaque
+    for quality in JPEG_QUALITIES:
+        pixbuf.savev(destination, "jpeg", ["quality"], [str(quality)])
+        if os.path.getsize(destination) <= budget:
+            return {"path": destination, "width": pixbuf.get_width(), "height": pixbuf.get_height()}, "Encoded."
+    raise Fail("IMAGE_TOO_LARGE", f"The screenshot does not fit in {budget} bytes.")
+
+
+COMMANDS = {
+    "see": command_see,
+    "click": command_click,
+    "type": command_type,
+    "press": command_press,
+    "scroll": command_scroll,
+    "drag": command_drag,
+    "move": command_move,
+    "hold": command_hold,
+    "clipboard": command_clipboard,
+    "app": command_app,
+    "window": command_window,
+    "screen": command_screen,
+}
+
+
+def main(argv):
+    try:
+        positional, options = parse_args(argv)
+        command = positional[0] if positional else ""
+        if command == "permissions":
+            data, summary = command_permissions()
+        elif command == "jpeg":
+            data, summary = command_jpeg(positional[1:])
+        elif command in COMMANDS:
+            data, summary = COMMANDS[command](Desktop(), positional[1:], options)
+        else:
+            raise Fail("INVALID_ARGUMENTS", f"Unknown command {command!r}.")
+        envelope = {"success": True, "data": data, "summary": summary}
+    except Fail as failure:
+        error = {"code": failure.code, "message": failure.message}
+        if failure.details:
+            error["details"] = failure.details
+        envelope = {"success": False, "error": error}
+    except GLib.Error as error:
+        envelope = {"success": False, "error": {"code": "DESKTOP_COMMAND_FAILED", "message": error.message}}
+    sys.stdout.write(json.dumps(envelope, ensure_ascii=False))
+    return 0 if envelope["success"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

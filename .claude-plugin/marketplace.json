@@ -1,0 +1,6 @@
+{
+  "name": "computer-claude",
+  "description": "Computer Claude: Computer Use for Claude Code on GNOME Wayland",
+  "owner": { "name": "edsoncantuaria" },
+  "plugins": [{ "name": "computer-claude", "source": "./" }]
+}
