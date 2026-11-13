@@ -67,21 +67,21 @@ The plugin also ships a skill, `using-the-desktop`, that teaches Claude how to u
 
 ## The agent cursor
 
-While Claude acts, an orange cursor labelled "Claude" glides to where the action lands and leaves a fading trail; clicks end in a ripple. It is Claude's own cursor, drawn by the GNOME Shell extension above all windows, so you can follow what it does even when an action never touches your real pointer (element clicks, typing, key presses). Typing shows "typing", never the text; key presses show the keys. The cursor fades after about two seconds and is hidden while screenshots are taken, so Claude never sees it.
+While Claude acts, its own cursor appears on screen: a hollow white arrowhead with a small orange pill beside it that says what Claude is doing right now, such as "Checking Calculadora", "Clicking “Save”", "Typing", "Pressing Enter" or "Opening Calculator". The pill stays while the action runs, then fades. The arrow glides to where the action lands and leaves a fading trail, and clicks end in a ripple. It is drawn by the GNOME Shell extension above all windows, so you can follow what Claude does even when an action never touches your real pointer (element clicks, typing, key presses). Typed text is never shown, only the word "Typing". The cursor is hidden while screenshots are taken, so Claude never sees it.
 
-An extension older than v0.3.0 keeps working but draws only a dot for real pointer moves; log out and back in once after updating to get the full cursor.
+An extension older than v0.5.0 keeps working but shows the label only briefly; log out and back in once after updating to get the persistent label.
 
 ## Emergency stop
 
 Press **Super+Ctrl+Esc** and Claude stops at once, whichever window has the focus. Every action fails with `HALTED` and a "Claude paused" pill shows at the top of the screen; looking (screenshots, element trees) still works. Press the same keys again to resume. Held keys and buttons are released when you pause.
 
-The switch lives in the GNOME Shell extension, not in the plugin, so it works even if Claude Code hangs. Claude can pause itself with those keys but never resume itself: while paused the extension refuses every key it is sent. Needs extension API 6 (v0.4.0), so log out and back in once after updating. If another program already uses the shortcut, the extension still works without it and `Ping` reports `halt_shortcut: false`.
+The switch lives in the GNOME Shell extension, not in the plugin, so it works even if Claude Code hangs. Claude can pause itself with those keys but never resume itself: while paused the extension refuses every key it is sent. Needs extension API 6 or newer (v0.4.0), so log out and back in once after updating. If another program already uses the shortcut, the extension still works without it and `Ping` reports `halt_shortcut: false`.
 
 ## How it works
 
 | Part | Role |
 | --- | --- |
-| [`desktop/gnome-extension/`](desktop/gnome-extension/extension.js) | GNOME Shell extension. Exposes `io.github.edsoncantuaria.ComputerClaude` on the session bus: window list and geometry, screenshots (windows are captured even when covered), pointer and keyboard injection, clipboard, app launch. |
+| [`desktop/gnome-extension/`](desktop/gnome-extension/extension.js) | GNOME Shell extension. Exposes `io.github.edsoncantuaria.ComputerClaude` on the session bus: window list and geometry, screenshots (windows are captured even when covered, though a covered app may not have redrawn), pointer and keyboard injection, clipboard, app launch. |
 | [`desktop/computer-claude-desktop`](desktop/computer-claude-desktop) | Python command line that composes those primitives with AT-SPI element trees and optional OCR. |
 | [`src/`](src/server.ts) → `dist/server.mjs` | stdio MCP server that publishes the `computer_*` tools. The bundle is committed, so the plugin needs no `npm install`. |
 
@@ -90,6 +90,8 @@ The extension exists because GNOME Shell denies window introspection and screens
 ## Behavior worth knowing
 
 - **Input stays out of your way.** Unless `foreground=true`, a plain click on an element runs its accessibility action without moving the pointer or changing focus, and typing writes into the window's field directly. Key presses, drags, and scrolling in covered windows borrow focus and hand it back.
+- **The Activities overview is closed first.** It covers every window and takes pointer input away from them, so an action that needs input closes it before acting.
+- **A covered window's picture can lag.** Apps stop drawing while nothing shows them, so the screenshot of a covered, minimized or overview-hidden window may be out of date. The observation says so; the element list stays current, so trust it over the picture.
 - **System dialogs stop input.** While a GNOME dialog (keyring, polkit) or the lock screen holds the keyboard, input tools fail with `SYSTEM_DIALOG_ACTIVE` or `SCREEN_LOCKED` instead of reporting success.
 - **Typing is checked.** When the field can be read, text that did not arrive fails with `INPUT_NOT_DELIVERED`.
 - **Typing follows your keyboard layout.** Characters with no key go through the input method or the clipboard.

@@ -11,6 +11,7 @@ input, so every action first focuses its target window and then drives the real
 pointer and keyboard.
 """
 
+import gettext
 import json
 import os
 import secrets
@@ -39,6 +40,8 @@ INTERFACE = "io.github.edsoncantuaria.ComputerClaude"
 SUPPORTED_API = 4  # the oldest extension this helper can drive
 CURSOR_API = 5  # first extension that draws the agent cursor
 HALT_API = 6  # first extension with the user's emergency stop (Super+Ctrl+Esc)
+ANNOUNCE_API = 7  # first extension that keeps the cursor's label up while an action runs, and can close the overview
+OVERVIEW_CLOSE_S = 0.45  # the shell animates the overview away before windows take input again
 # Commands that act on the desktop; reading (see, screen) keeps working while paused.
 ACTING_COMMANDS = {"click", "type", "press", "scroll", "drag", "move", "hold", "clipboard", "app", "window"}
 
@@ -237,6 +240,23 @@ class Desktop:
         except Fail:
             pass
 
+    def announce(self, x, y, label):
+        """Name the action in progress on the agent's cursor. Returns at once; the label stays until announce_done."""
+        if self.api < ANNOUNCE_API:
+            return
+        try:
+            self.call("AgentCursor", GLib.Variant("(ddss)", (float(x), float(y), "busy", label)))
+        except Fail:
+            pass
+
+    def announce_done(self):
+        if self.api < ANNOUNCE_API:
+            return
+        try:
+            self.call("AgentCursor", GLib.Variant("(ddss)", (0.0, 0.0, "idle", "")))
+        except Fail:
+            pass
+
     def pointer_move(self, x, y):
         self.call("PointerMove", GLib.Variant("(dd)", (float(x), float(y))))
 
@@ -245,6 +265,12 @@ class Desktop:
         state = json.loads(self.call("ShellState"))
         if state["locked"]:
             raise Fail("SCREEN_LOCKED", "The screen is locked. Ask the user to unlock it.")
+        if state.get("overview"):
+            # The overview sits above every window, so pointer input would land on it, not on the app.
+            if self.api < ANNOUNCE_API:
+                raise Fail("OVERVIEW_ACTIVE", "The Activities overview is open and covers the windows. Ask the user to close it.")
+            self.call("HideOverview")
+            time.sleep(OVERVIEW_CLOSE_S)
         if state["dialog"]:
             raise Fail(
                 "SYSTEM_DIALOG_ACTIVE",
@@ -900,7 +926,7 @@ def show_typing(desktop, window, field):
     except GLib.Error:
         pass
     if point:
-        desktop.agent_cursor(*point, "type", "typing")
+        desktop.agent_cursor(*point, "type", "Typing")
 
 
 def insert_without_focus(desktop, window, text, clear):
@@ -955,6 +981,15 @@ def target_window(desktop, options):
     if "--app" in options or "--window-id" in options or "--snapshot" in options:
         return resolve_window(desktop, options, optional_snapshot(options))
     return None
+
+
+def window_covered(desktop, window):
+    """True when nothing is showing this window, so its app may not have redrawn yet."""
+    if window["minimized"] or not window["on_active_workspace"]:
+        return True
+    if json.loads(desktop.call("ShellState")).get("overview"):
+        return True
+    return not point_exposed(desktop, window, window["x"] + window["width"] / 2, window["y"] + window["height"] / 2)
 
 
 def point_exposed(desktop, window, x, y):
@@ -1230,6 +1265,13 @@ def observe_window(desktop, window, options, snapshot_id, tree, capture, path):
         )
         if truncated:
             data["text"] += f"\n... more elements exist; call computer_inspect with offset={skip + len(elements)}."
+    if capture and window_covered(desktop, window):
+        # Apps stop drawing while nothing shows them, so the picture can lag behind what they just did.
+        data["screenshot_may_be_stale"] = True
+        data["text"] = (
+            "Note: this window is covered, minimized or behind the overview, so the screenshot may be out of "
+            "date. The element list is current; trust it over the picture.\n" + data.get("text", "")
+        ).rstrip()
     return data, f"Observed {application} — {window['title']}."
 
 
@@ -1263,7 +1305,8 @@ def command_click(desktop, positional, options):
         plain_click = button == BUTTONS["left"] and count == 1 and not hold
         if plain_click and not options.get("--foreground"):
             window = element_window(desktop, snapshot, element)
-            desktop.agent_cursor(*element_center(window, element), "click")
+            name = short(element["label"]) if element.get("label") else ""
+            desktop.agent_cursor(*element_center(window, element), "click", f"Clicking “{name}”" if name else "Clicking")
             if activate_element(window, element):
                 return {"clicked": target, "via": "accessibility"}, f"Activated {target}."
             if grab_field_focus(desktop, window, element, positional[0] if positional else None):
@@ -1451,7 +1494,8 @@ def command_press(desktop, positional, options):
     window = target_window(desktop, options)
     if window is not None:
         desktop.agent_cursor(
-            window["x"] + window["width"] / 2, window["y"] + window["height"] / 2, "key", " ".join(positional)
+            window["x"] + window["width"] / 2, window["y"] + window["height"] / 2, "key",
+            f"Pressing {short(' '.join(positional), 24)}",
         )
     with borrowed_focus(desktop, window, options):
         for _ in range(integer(options, "--count", 1)):
@@ -1598,6 +1642,18 @@ def drag_pointer(desktop, options, window, origin_x, origin_y):
             desktop.pointer_button(BUTTONS["left"], False)
 
 
+def translated_name(info):
+    """The name the user sees. GNOME translates it through the app's own gettext domain, which the
+    .desktop file names but GLib does not apply, so "Calculator" is "Calculadora" on the screen."""
+    if not isinstance(info, Gio.DesktopAppInfo):
+        return ""
+    for key in ("X-GNOME-Gettext-Domain", "X-Ubuntu-Gettext-Domain"):
+        domain = info.get_string(key)
+        if domain:
+            return gettext.dgettext(domain, info.get_name())
+    return ""
+
+
 def find_application(name):
     wanted = name.casefold()
     applications = [info for info in Gio.AppInfo.get_all() if info.should_show()]
@@ -1607,7 +1663,10 @@ def find_application(name):
         executable = os.path.basename(info.get_executable() or "")
         return [
             value.casefold()
-            for value in (identifier, identifier.removesuffix(".desktop"), info.get_name(), info.get_display_name(), executable)
+            for value in (
+                identifier, identifier.removesuffix(".desktop"), info.get_name(), info.get_display_name(),
+                executable, translated_name(info),
+            )
             if value
         ]
 
@@ -1861,6 +1920,79 @@ def command_jpeg(positional):
     raise Fail("IMAGE_TOO_LARGE", f"The screenshot does not fit in {budget} bytes.")
 
 
+def short(text, limit=28):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def action_label(command, positional, options):
+    """What the cursor says Claude is doing. Never includes typed text."""
+    app = options.get("--app", "")
+    first = positional[0] if positional else ""
+    if command == "see":
+        if options.get("--wait-for"):
+            return f"Waiting for “{short(options['--wait-for'])}”"
+        if options.get("--mode") in ("screen", "frontmost"):
+            return "Checking the screen"
+        return f"Checking {short(app)}" if app else "Looking around"
+    if command == "click":
+        return f"Clicking “{short(first)}”" if first else "Clicking"
+    if command == "type":
+        return "Typing"
+    if command == "press":
+        return f"Pressing {short(' '.join(positional), 24)}"
+    if command == "scroll":
+        return f"Scrolling {options.get('--direction', '')}".strip()
+    if command == "drag":
+        return "Dragging"
+    if command == "move":
+        return "Moving the pointer"
+    if command == "hold":
+        return f"Holding {short(options.get('--keys') or options.get('--button') or 'input', 20)}"
+    if command == "clipboard":
+        return "Using the clipboard"
+    if command == "app":
+        target = short(positional[1] if len(positional) > 1 else options.get("--app") or options.get("--to") or "")
+        verbs = {"launch": "Opening", "quit": "Closing", "switch": "Switching to", "relaunch": "Restarting",
+                 "hide": "Hiding", "unhide": "Showing"}
+        return f"{verbs[first]} {target}".strip() if first in verbs else ""
+    if command == "window":
+        verbs = {"focus": "Focusing", "close": "Closing", "minimize": "Minimizing", "restore": "Restoring",
+                 "maximize": "Maximizing", "move": "Moving", "resize": "Resizing", "set_bounds": "Placing"}
+        return f"{verbs[first]} the window" if first in verbs else ""
+    return ""
+
+
+def announcement_point(desktop, options):
+    """Where the cursor shows an action that has no point of its own: the middle of its window, else of the screen."""
+    try:
+        window = target_window(desktop, options)
+    except Fail:
+        window = None
+    if window is not None:
+        return window["x"] + window["width"] / 2, window["y"] + window["height"] / 2
+    monitors = desktop.monitors()
+    monitor = next((item for item in monitors if item["primary"]), monitors[0] if monitors else None)
+    if monitor is None:
+        return None
+    return monitor["x"] + monitor["width"] / 2, monitor["y"] + monitor["height"] / 2
+
+
+@contextmanager
+def announcing(desktop, command, positional, options):
+    """Keep the agent's cursor and a label of the running action on screen while the command works."""
+    label = action_label(command, positional, options) if desktop.api >= ANNOUNCE_API else ""
+    if label:
+        point = announcement_point(desktop, options)
+        if point is not None:
+            desktop.announce(*point, label)
+    try:
+        yield
+    finally:
+        if label:
+            desktop.announce_done()
+
+
 COMMANDS = {
     "see": command_see,
     "click": command_click,
@@ -1893,7 +2025,8 @@ def main(argv):
                     "HALTED",
                     "The user paused Claude with Super+Ctrl+Esc. Do not retry; wait until the user resumes.",
                 )
-            data, summary = COMMANDS[command](desktop, positional[1:], options)
+            with announcing(desktop, command, positional[1:], options):
+                data, summary = COMMANDS[command](desktop, positional[1:], options)
         else:
             raise Fail("INVALID_ARGUMENTS", f"Unknown command {command!r}.")
         envelope = {"success": True, "data": data, "summary": summary}

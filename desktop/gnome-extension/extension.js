@@ -22,13 +22,14 @@ import * as Main from "resource:///org/gnome/shell/ui/main.js"
 const BUS_NAME = "io.github.edsoncantuaria.ComputerClaude"
 const OBJECT_PATH = "/io/github/edsoncantuaria/ComputerClaude"
 const ERROR_NAME = "io.github.edsoncantuaria.ComputerClaude.Error"
-const API_VERSION = 6
+const API_VERSION = 7
 
 const INTERFACE = `
 <node>
   <interface name="io.github.edsoncantuaria.ComputerClaude">
     <method name="Ping"><arg type="s" direction="out"/></method>
     <method name="Halted"><arg type="b" direction="out"/></method>
+    <method name="HideOverview"/>
     <method name="WindowPointer">
       <arg type="t" name="id" direction="in"/>
       <arg type="d" name="x" direction="in"/>
@@ -146,6 +147,8 @@ const MAX_WORKSPACE_INDEX = 35
 
 // The agent's own cursor: it shows where Claude is acting, whether or not it moves the real pointer.
 const CURSOR_LINGER_MS = 1800
+// A long-running action keeps its label up this long at most if its end is never reported.
+const CURSOR_BUSY_MAX_MS = 30_000
 const CURSOR_FADE_MS = 350
 const CURSOR_TRAVEL_MS = [140, 420]
 const CURSOR_PX_PER_MS = 1.6
@@ -217,32 +220,35 @@ function unmaximize(window) {
 class AgentCursor {
   constructor() {
     this._layer = new St.Widget({ reactive: false, visible: false, opacity: 0 })
-    this._arrow = new St.DrawingArea({ width: 36, height: 36, reactive: false })
+    // Claude's own pointer: a hollow white arrowhead, tip at the top left, like the one Claude in
+    // Chrome draws. A thin dark rim keeps it visible on white backgrounds.
+    this._arrow = new St.DrawingArea({ width: 28, height: 28, reactive: false })
     this._arrow.connect("repaint", (area) => {
       const cr = area.get_context()
-      cr.scale(1.45, 1.45)
-      cr.moveTo(2, 2)
-      cr.lineTo(2, 19)
-      cr.lineTo(6.5, 15)
-      cr.lineTo(9.5, 21.5)
-      cr.lineTo(12.5, 20)
-      cr.lineTo(9.5, 13.5)
-      cr.lineTo(15.5, 13.5)
+      cr.setLineJoin(1) // round
+      cr.setLineCap(1)
+      cr.moveTo(4.4, 4.4)
+      cr.lineTo(20.6, 11)
+      cr.lineTo(13.9, 12.9)
+      cr.lineTo(11.6, 20.6)
       cr.closePath()
-      // A dark rim under the white one keeps the arrow visible on orange and white backgrounds alike.
-      cr.setSourceRGBA(0, 0, 0, 0.55)
+      cr.setSourceRGBA(0, 0, 0, 0.5)
       cr.setLineWidth(3.6)
       cr.strokePreserve()
-      cr.setSourceRGBA(0.851, 0.467, 0.341, 1)
+      cr.setSourceRGBA(0.78, 0.39, 0.26, 0.3)
       cr.fillPreserve()
       cr.setSourceRGBA(1, 1, 1, 1)
       cr.setLineWidth(1.8)
       cr.stroke()
       cr.$dispose()
     })
+    // A flat orange pill that names what Claude is doing right now.
     this._label = new St.Label({
       text: "Claude",
-      style: `background-color: ${color(0.95)}; color: white; border-radius: 10px; padding: 2px 9px; font-size: 11px; font-weight: bold;`,
+      style:
+        "background-color: rgb(192, 99, 65); color: rgb(255, 244, 236); " +
+        "font-size: 12px; font-weight: 500; border-radius: 999px; padding: 4px 14px; " +
+        "box-shadow: 0 1px 5px rgba(0, 0, 0, 0.3);",
     })
     this._layer.add_child(this._arrow)
     this._layer.add_child(this._label)
@@ -252,6 +258,7 @@ class AgentCursor {
     this._tween = 0
     this._linger = 0
     this._pending = null
+    this._sticky = false
     this._trail = new Set()
   }
 
@@ -262,9 +269,12 @@ class AgentCursor {
   }
 
   // Moves the arrow along an eased path, leaving a fading trail. `done` runs on arrival.
-  moveTo(x, y, { label = "", click = false, done = null } = {}) {
+  // `label` names the action; left out, the previous one stays. `sticky` keeps the arrow and its
+  // label on screen until idle() (the action is still running), with a cap in case that never comes.
+  moveTo(x, y, { label, click = false, done = null, sticky = false } = {}) {
     this._stopTween()
     this._pending = done
+    this._sticky = sticky
     this._setLabel(label)
     this._reveal()
     const fromX = this._x ?? x
@@ -287,11 +297,17 @@ class AgentCursor {
       if (t < 1) return GLib.SOURCE_CONTINUE
       this._tween = 0
       if (click) this._ripple(x, y)
-      this._scheduleFade()
+      this._scheduleFade(this._sticky ? CURSOR_BUSY_MAX_MS : CURSOR_LINGER_MS)
       this._settle()
       return GLib.SOURCE_REMOVE
     }
     this._tween = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FRAME_MS, step)
+  }
+
+  // The action ended: let the arrow and its label fade out.
+  idle() {
+    this._sticky = false
+    if (this._layer.visible && !this._tween) this._scheduleFade(CURSOR_LINGER_MS)
   }
 
   ripple(x, y) {
@@ -332,9 +348,9 @@ class AgentCursor {
     this._layer.ease({ opacity: 255, duration: 90, mode: Clutter.AnimationMode.EASE_OUT_QUAD })
   }
 
-  _scheduleFade() {
+  _scheduleFade(delay = CURSOR_LINGER_MS) {
     if (this._linger) GLib.source_remove(this._linger)
-    this._linger = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CURSOR_LINGER_MS, () => {
+    this._linger = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
       this._linger = 0
       this._layer.ease({
         opacity: 0,
@@ -349,15 +365,26 @@ class AgentCursor {
   }
 
   _setLabel(label) {
-    this._label.text = label ? `Claude · ${label}` : "Claude"
+    if (label !== undefined) this._label.text = label || "Claude"
   }
 
   _place(x, y) {
     this._x = x
     this._y = y
-    // The arrow's tip is at (2, 2) in its own space.
-    this._arrow.set_position(Math.round(x - 3), Math.round(y - 3))
-    this._label.set_position(Math.round(x + 18), Math.round(y + 26))
+    // The arrow's tip is at (4.4, 4.4) in its own space.
+    this._arrow.set_position(Math.round(x - 4), Math.round(y - 4))
+    // The label sits below and to the right of the arrow, and flips to stay on its screen.
+    const monitor =
+      Main.layoutManager.monitors.find(
+        (m) => x >= m.x && x < m.x + m.width && y >= m.y && y < m.y + m.height
+      ) ?? Main.layoutManager.primaryMonitor
+    const [, width] = this._label.get_preferred_width(-1)
+    const [, height] = this._label.get_preferred_height(-1)
+    let labelX = x + 28
+    let labelY = y + 5
+    if (labelX + width > monitor.x + monitor.width - 8) labelX = x - 8 - width
+    if (labelY + height > monitor.y + monitor.height - 8) labelY = y - 8 - height
+    this._label.set_position(Math.round(labelX), Math.round(labelY))
   }
 
   _dot(x, y) {
@@ -697,11 +724,20 @@ class DesktopService {
       invocation.return_dbus_error(ERROR_NAME, HALT_MESSAGE)
       return
     }
-    this._agent.moveTo(x, y, {
-      label,
-      click: action === "click",
-      done: () => invocation.return_value(null),
-    })
+    if (action === "idle") {
+      this._agent.idle()
+      invocation.return_value(null)
+    } else if (action === "busy") {
+      // Announces a running action and returns at once; the arrow keeps its label until idle.
+      this._agent.moveTo(x, y, { label, sticky: true })
+      invocation.return_value(null)
+    } else {
+      this._agent.moveTo(x, y, {
+        label,
+        click: action === "click",
+        done: () => invocation.return_value(null),
+      })
+    }
   }
 
   // A system dialog or the lock screen takes all input away from applications.
@@ -745,7 +781,14 @@ class DesktopService {
     return JSON.stringify({
       dialog: dialogs.some((actor) => actor.visible),
       locked: Main.sessionMode.isLocked,
+      // The Activities overview covers every window and takes pointer input away from them.
+      overview: Main.overview.visible,
     })
+  }
+
+  HideOverview() {
+    this._guard()
+    Main.overview.hide()
   }
 
   PointerRelative(dx, dy) {

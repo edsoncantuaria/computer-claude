@@ -34303,7 +34303,7 @@ function recordError(entry) {
     }
     const line = JSON.stringify({
       time: (/* @__PURE__ */ new Date()).toISOString(),
-      version: "0.4.1",
+      version: "0.5.0",
       source: entry.source,
       code: entry.code,
       command: entry.command,
@@ -35358,7 +35358,7 @@ Observes and controls the user's real GNOME desktop, which the user shares with 
 - If a tool reports that the Computer Claude extension is not running, tell the user to run /computer-claude:setup.`;
 var desktop = new DesktopClient();
 var server = new McpServer(
-  { name: "computer-claude", version: "0.4.1" },
+  { name: "computer-claude", version: "0.5.0" },
   { instructions: INSTRUCTIONS }
 );
 registerComputerUseTools(server.registerTool.bind(server), desktop);
