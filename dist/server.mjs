@@ -7,7 +7,7 @@ var __export = (target, all) => {
 };
 
 // src/server.ts
-import process3 from "node:process";
+import process4 from "node:process";
 
 // node_modules/@modelcontextprotocol/server/dist/chunk-Br0eD_fh.mjs
 var __create = Object.create;
@@ -33750,6 +33750,8 @@ var PID_APP_RE = /^PID:\d+$/u;
 var DesktopError = class extends Error {
   code;
   details;
+  /** The helper command that failed, set once the error leaves runNow. */
+  command;
   constructor(code, message, details, options) {
     super(message, options);
     this.name = "DesktopError";
@@ -34053,6 +34055,14 @@ var DesktopClient = class {
     }
   }
   async runNow(args, signal) {
+    try {
+      return await this.execute(args, signal);
+    } catch (error62) {
+      if (error62 instanceof DesktopError) error62.command ??= args[0];
+      throw error62;
+    }
+  }
+  async execute(args, signal) {
     const commandArgs = [...this.baseArgs, ...args, "--json"];
     let stdout;
     let stderr;
@@ -34270,6 +34280,42 @@ function sessionEnvironment() {
   };
 }
 
+// src/error-log.ts
+import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname as dirname2, join as join2 } from "node:path";
+import process3 from "node:process";
+var MAX_LOG_BYTES = 1e6;
+var MAX_FIELD_CHARS = 1e3;
+function errorLogPath() {
+  const state = process3.env.XDG_STATE_HOME || join2(homedir(), ".local", "state");
+  return join2(state, "computer-claude", "errors.jsonl");
+}
+var clip = (value) => value === void 0 ? void 0 : value.slice(0, MAX_FIELD_CHARS);
+function recordError(entry) {
+  if (process3.env.COMPUTER_CLAUDE_NO_ERROR_LOG) return;
+  try {
+    const path = errorLogPath();
+    mkdirSync(dirname2(path), { recursive: true, mode: 448 });
+    try {
+      if (statSync(path).size > MAX_LOG_BYTES) renameSync(path, `${path}.1`);
+    } catch {
+    }
+    const line = JSON.stringify({
+      time: (/* @__PURE__ */ new Date()).toISOString(),
+      version: "0.4.1",
+      source: entry.source,
+      code: entry.code,
+      command: entry.command,
+      message: clip(entry.message),
+      details: clip(entry.details)
+    });
+    appendFileSync(path, `${line}
+`, { mode: 384 });
+  } catch {
+  }
+}
+
 // src/tool-shared.ts
 var appInput = external_exports.string().min(1).describe("App name, bundle or desktop ID, or PID:12345.");
 var snapshotInput = external_exports.string().min(1).describe("Snapshot ID from computer_observe or computer_inspect.");
@@ -34296,6 +34342,22 @@ function commandResult(result, fallbackSummary) {
   return { content: [{ type: "text", text: summary }] };
 }
 function desktopToolError(error62) {
+  if (error62 instanceof DesktopError) {
+    recordError({
+      source: "tool",
+      code: error62.code,
+      message: error62.message,
+      command: error62.command,
+      details: error62.details
+    });
+  } else {
+    recordError({
+      source: "tool",
+      code: "UNEXPECTED_ERROR",
+      message: error62 instanceof Error ? error62.message : String(error62),
+      details: error62 instanceof Error ? error62.stack : void 0
+    });
+  }
   if (error62 instanceof DesktopError) {
     return {
       content: [
@@ -35296,7 +35358,7 @@ Observes and controls the user's real GNOME desktop, which the user shares with 
 - If a tool reports that the Computer Claude extension is not running, tell the user to run /computer-claude:setup.`;
 var desktop = new DesktopClient();
 var server = new McpServer(
-  { name: "computer-claude", version: "0.4.0" },
+  { name: "computer-claude", version: "0.4.1" },
   { instructions: INSTRUCTIONS }
 );
 registerComputerUseTools(server.registerTool.bind(server), desktop);
@@ -35306,10 +35368,21 @@ async function shutdown() {
   if (closing) return;
   closing = true;
   await Promise.allSettled([server.close(), desktop.close()]);
-  process3.exit(0);
+  process4.exit(0);
 }
-for (const signal of ["SIGINT", "SIGTERM"]) process3.once(signal, () => void shutdown());
-process3.stdin.once("end", () => void shutdown());
+for (const signal of ["SIGINT", "SIGTERM"]) process4.once(signal, () => void shutdown());
+for (const event of ["uncaughtException", "unhandledRejection"]) {
+  process4.on(event, (reason) => {
+    recordError({
+      source: "process",
+      code: event.toUpperCase(),
+      message: reason instanceof Error ? reason.message : String(reason),
+      details: reason instanceof Error ? reason.stack : void 0
+    });
+    process4.exit(1);
+  });
+}
+process4.stdin.once("end", () => void shutdown());
 /*! Bundled license information:
 
 @modelcontextprotocol/server/dist/src-CX2iR2pK.mjs:

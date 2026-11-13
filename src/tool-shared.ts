@@ -1,6 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { type DesktopClient, DesktopError, type DesktopResult } from "./desktop-client.js"
+import { recordError } from "./error-log.js"
 
 export const appInput = z.string().min(1).describe("App name, bundle or desktop ID, or PID:12345.")
 export const snapshotInput = z
@@ -47,6 +48,23 @@ export function commandResult(result: DesktopResult, fallbackSummary: string): C
 }
 
 export function desktopToolError(error: unknown): CallToolResult {
+  // Every failed tool call ends here, so this is the one place that keeps a record of it.
+  if (error instanceof DesktopError) {
+    recordError({
+      source: "tool",
+      code: error.code,
+      message: error.message,
+      command: error.command,
+      details: error.details,
+    })
+  } else {
+    recordError({
+      source: "tool",
+      code: "UNEXPECTED_ERROR",
+      message: error instanceof Error ? error.message : String(error),
+      details: error instanceof Error ? error.stack : undefined,
+    })
+  }
   if (error instanceof DesktopError) {
     return {
       content: [

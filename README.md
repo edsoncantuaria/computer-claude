@@ -98,6 +98,16 @@ The extension exists because GNOME Shell denies window introspection and screens
 - **Shortcuts that end the session are refused.** Ctrl+Alt with a function key, Delete, or Backspace fails with `BLOCKED_SHORTCUT`.
 - **Element trees depend on the app.** Screenshots, coordinates, typing, and window actions work on every window. GTK, Qt, and X11 toolkits expose elements by default; Chromium, Electron, Firefox, QtWebEngine, and Java apps need the switch that setup enables.
 
+## Error log
+
+Every failed tool call, and any crash of the MCP server, adds one JSON line to `~/.local/state/computer-claude/errors.jsonl` (`$XDG_STATE_HOME` if set): time, plugin version, failing command, error code, message, and details such as a traceback for a bug in the helper. It stays on your machine and nothing is sent anywhere. Typed text, screenshots and tool arguments are never recorded, but a message can name a window or app. The file is private to you (mode 600) and rolls over at about 1 MB. Set `COMPUTER_CLAUDE_NO_ERROR_LOG=1` to turn it off.
+
+```bash
+tail -n 20 ~/.local/state/computer-claude/errors.jsonl
+```
+
+Arguments the MCP SDK rejects before a tool runs are not logged. Failures inside the GNOME Shell extension show up in `journalctl --user -b /usr/bin/gnome-shell`.
+
 ## Trust boundary
 
 Any process on your session bus can call the extension's service, which means it can read the screen and inject input. For callers that must stay inside one window (a remote view of a single window, say), the service also offers `WindowPointer`, `WindowScroll` and `WindowKey`: pointer points are relative to the window and refused unless that exact spot belongs to the window, and keys require the window to have the focus. That is the same trust domain as the desktop session itself; sandboxed (Flatpak) apps cannot reach it unless granted session-bus access. Screenshots are only written inside your runtime directory.

@@ -107,6 +107,8 @@ export interface DesktopClientOptions {
 export class DesktopError extends Error {
   readonly code: string
   readonly details?: string
+  /** The helper command that failed, set once the error leaves runNow. */
+  command?: string
 
   constructor(code: string, message: string, details?: string, options?: ErrorOptions) {
     super(message, options)
@@ -480,6 +482,15 @@ export class DesktopClient {
   }
 
   private async runNow(args: string[], signal: AbortSignal): Promise<DesktopResult> {
+    try {
+      return await this.execute(args, signal)
+    } catch (error) {
+      if (error instanceof DesktopError) error.command ??= args[0]
+      throw error
+    }
+  }
+
+  private async execute(args: string[], signal: AbortSignal): Promise<DesktopResult> {
     const commandArgs = [...this.baseArgs, ...args, "--json"]
     let stdout: string
     let stderr: string

@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import warnings
 from contextlib import contextmanager
 
@@ -1903,6 +1904,15 @@ def main(argv):
         envelope = {"success": False, "error": error}
     except GLib.Error as error:
         envelope = {"success": False, "error": {"code": "DESKTOP_COMMAND_FAILED", "message": error.message}}
+    except Exception as error:  # a bug: report it with its traceback, which the server keeps in its error log
+        envelope = {
+            "success": False,
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": f"{type(error).__name__}: {error}",
+                "details": traceback.format_exc()[-1500:],
+            },
+        }
     sys.stdout.write(json.dumps(envelope, ensure_ascii=False))
     return 0 if envelope["success"] else 1
 

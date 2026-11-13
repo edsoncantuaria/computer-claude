@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/server"
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio"
 import { registerComputerUseTools } from "./computer-tools.js"
 import { DesktopClient } from "./desktop-client.js"
+import { recordError } from "./error-log.js"
 
 declare const __VERSION__: string
 
@@ -38,4 +39,16 @@ async function shutdown(): Promise<void> {
   process.exit(0)
 }
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => void shutdown())
+// A crash of the server itself leaves a record too, then ends as Node would have.
+for (const event of ["uncaughtException", "unhandledRejection"] as const) {
+  process.on(event, (reason: unknown) => {
+    recordError({
+      source: "process",
+      code: event.toUpperCase(),
+      message: reason instanceof Error ? reason.message : String(reason),
+      details: reason instanceof Error ? reason.stack : undefined,
+    })
+    process.exit(1)
+  })
+}
 process.stdin.once("end", () => void shutdown())
