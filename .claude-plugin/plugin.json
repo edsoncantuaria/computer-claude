@@ -1,6 +1,6 @@
 {
   "name": "computer-claude",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Computer Use for Claude Code on GNOME Wayland: Claude sees your desktop and drives it with screenshots, element trees, clicks, typing, keys, scrolling, drags, windows, apps, and the clipboard.",
   "author": {
     "name": "edsoncantuaria",

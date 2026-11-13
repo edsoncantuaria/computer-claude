@@ -33749,7 +33749,7 @@ function append(file2, record2) {
       if (statSync(path).size > MAX_LOG_BYTES) renameSync(path, `${path}.1`);
     } catch {
     }
-    const line = JSON.stringify({ time: (/* @__PURE__ */ new Date()).toISOString(), version: "0.5.0", ...record2 });
+    const line = JSON.stringify({ time: (/* @__PURE__ */ new Date()).toISOString(), version: "0.6.0", ...record2 });
     appendFileSync(path, `${line}
 `, { mode: 384 });
   } catch {
@@ -35769,7 +35769,7 @@ Observes and controls the user's real GNOME desktop, which the user shares with 
 - If a tool reports that the Computer Claude extension is not running, tell the user to run /computer-claude:setup.`;
 var desktop = new DesktopClient();
 var server = new McpServer(
-  { name: "computer-claude", version: "0.5.0" },
+  { name: "computer-claude", version: "0.6.0" },
   { instructions: INSTRUCTIONS }
 );
 registerComputerUseTools(server.registerTool.bind(server), desktop);
