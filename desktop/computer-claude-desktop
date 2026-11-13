@@ -45,6 +45,7 @@ ANNOUNCE_API = 7  # first extension that keeps the cursor's label up while an ac
 ACCESS_API = 8  # first extension that asks the user which apps Claude may use
 ACCESS_PROMPT_TIMEOUT_MS = 150_000  # the extension gives up on its dialog before this
 TIERS = {"read": 1, "click": 2, "full": 3}
+ALL_APPS_NOTE = "The user turned per-app access off: every app is allowed, with full control. Only they can change that."
 TIER_HELP = "read: observe only. click: observe, left-click and scroll. full: everything."
 # The least access each command needs on the window it targets. The extension enforces the same
 # on raw input, so input with no named target (foreground typing, global clicks) is covered there.
@@ -214,6 +215,8 @@ class Desktop:
         self.api = api if isinstance(api, int) else 0
         self.halted = self.api >= HALT_API and bool(info.get("halted"))
         self.asking = bool(info.get("asking"))
+        # The user can give Claude every app, in a file of their own (see README, "App access").
+        self.all_apps = info.get("access_mode") == "all"
         self.need = None  # the access the running command needs on its target; see COMMAND_ACCESS
         if self.api < SUPPORTED_API:
             raise Fail(
@@ -900,7 +903,7 @@ def element_window(desktop, snapshot, element):
         window = shell_window()
         grants = desktop.grants()
         if window is not None and grants is not None:
-            window["access"] = grants.get(SHELL_ACCESS_KEY, {}).get("tier", "")
+            window["access"] = "full" if desktop.all_apps else grants.get(SHELL_ACCESS_KEY, {}).get("tier", "")
         return require_access(desktop, window) if window is not None else None
     window = next((item for item in desktop.windows() if item["id"] == element["window_id"]), None)
     if window is None:
@@ -2050,10 +2053,14 @@ def command_access(desktop, positional, options):
         )
     if action == "list":
         grants = desktop.grants()
+        if desktop.all_apps:
+            return {"grants": grants, "mode": "all"}, ALL_APPS_NOTE
         lines = [f"{grant['name']}: {grant['tier']}" for grant in grants.values()]
         return {"grants": grants}, "\n".join(lines) or "No app is granted yet. Use action=request with the apps the task needs."
     if action == "revoke":
         desktop.call("RevokeAccess")
+        if desktop.all_apps:
+            return {"grants": {}, "mode": "all"}, f"Per-app grants were cleared. {ALL_APPS_NOTE}"
         return {"grants": {}}, "All access was revoked."
     if action != "request" or len(positional) < 2:
         raise Fail("INVALID_ARGUMENTS", "Use access list, access revoke, or access request <app>...")
@@ -2080,7 +2087,11 @@ def command_permissions():
         status["desktop_extension"] = failure.code
     status["accessibility"] = "ready" if accessibility_available() else "unavailable"
     if status["desktop_extension"] == "ready":
-        status["app_access"] = "enforced" if Desktop().api >= ACCESS_API else "off (extension outdated: log out and back in)"
+        desktop = Desktop()
+        if desktop.api < ACCESS_API:
+            status["app_access"] = "off (extension outdated: log out and back in)"
+        else:
+            status["app_access"] = "off (the user allows every app)" if desktop.all_apps else "enforced"
     lines = [f"{name}: {value}" for name, value in status.items()]
     if status["desktop_extension"] != "ready":
         lines.append("Run /computer-claude:setup in Claude Code, then log out and back in.")

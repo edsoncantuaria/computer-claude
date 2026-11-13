@@ -20,7 +20,17 @@ import { Extension } from "resource:///org/gnome/shell/extensions/extension.js"
 import * as Config from "resource:///org/gnome/shell/misc/config.js"
 import { getKeyboardManager } from "resource:///org/gnome/shell/misc/keyboardManager.js"
 import * as Main from "resource:///org/gnome/shell/ui/main.js"
-import { accessKey, askAccess, describeApp, grants, SHELL_KEY, TIER_TEXT, TIERS } from "./access.js"
+import {
+  accessKey,
+  accessMode,
+  askAccess,
+  describeApp,
+  grants,
+  SHELL_KEY,
+  TIER_TEXT,
+  TIERS,
+  tierOf,
+} from "./access.js"
 import { AgentCursor, HaltBadge } from "./overlay.js"
 
 const BUS_NAME = "io.github.edsoncantuaria.ComputerClaude"
@@ -283,7 +293,7 @@ class DesktopService {
   }
 
   _require(key, need) {
-    const tier = grants.get(key)
+    const tier = tierOf(key)
     if (tier && TIERS[tier] >= TIERS[need]) return
     const { name } = describeApp(key)
     if (!tier)
@@ -322,6 +332,7 @@ class DesktopService {
       halted: this._halted,
       halt_shortcut: this._acceleratorId !== 0,
       asking: this._asking,
+      access_mode: accessMode(),
     })
   }
 
@@ -344,7 +355,7 @@ class DesktopService {
           app: app?.get_name() ?? "",
           app_id: app?.get_id() ?? "",
           access_key: accessKey(window),
-          access: grants.get(accessKey(window)) ?? "",
+          access: tierOf(accessKey(window)),
           ...rectangle(window.get_frame_rect()),
           // An open menu holds the focus on behalf of its window.
           focused: global.display.focus_window?.find_root_ancestor() === window,
@@ -506,9 +517,7 @@ class DesktopService {
       .get_window_actors()
       .filter((actor) => {
         const window = actor.meta_window.find_root_ancestor()
-        return !(
-          UNOWNED_WINDOW_TYPES.has(window.get_window_type()) || grants.has(accessKey(window))
-        )
+        return !(UNOWNED_WINDOW_TYPES.has(window.get_window_type()) || tierOf(accessKey(window)))
       })
       .map((actor) => {
         const effect = new Clutter.BrightnessContrastEffect()
@@ -816,7 +825,7 @@ class DesktopService {
     if (Main.sessionMode.isLocked)
       throw new Error("SCREEN_LOCKED: The screen is locked. Ask the user to unlock it.")
     const entries = [...new Set(keys)].map((key) => ({ key, ...describeApp(key) }))
-    const wanted = entries.filter((entry) => !grants.has(entry.key))
+    const wanted = entries.filter((entry) => !tierOf(entry.key))
     if (wanted.length > 0) {
       this._asking = true
       this._agent.hide()
@@ -831,11 +840,9 @@ class DesktopService {
     }
     return {
       granted: Object.fromEntries(
-        entries
-          .filter((entry) => grants.has(entry.key))
-          .map((entry) => [entry.name, grants.get(entry.key)])
+        entries.filter((entry) => tierOf(entry.key)).map((entry) => [entry.name, tierOf(entry.key)])
       ),
-      denied: entries.filter((entry) => !grants.has(entry.key)).map((entry) => entry.name),
+      denied: entries.filter((entry) => !tierOf(entry.key)).map((entry) => entry.name),
     }
   }
 

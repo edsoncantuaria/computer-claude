@@ -83,6 +83,20 @@ Claude cannot look at or touch an app until you grant it. When a task needs an a
 
 Until an app is granted, its windows are painted black in screen captures (in the Activities overview too), its elements are left out, and clicks or keys that would land on it fail with `APP_NOT_GRANTED`. An action beyond an app's tier fails with `ACCESS_TIER`. The dialog belongs to the shell, and while it is open the extension refuses all input, so the answer is always yours. Window titles and app names stay visible in `computer_list`.
 
+To give Claude every app at once, with full control and no dialog, put the word `all` in `~/.config/computer-claude/access-mode`:
+
+```bash
+mkdir -p ~/.config/computer-claude && echo all > ~/.config/computer-claude/access-mode
+```
+
+It applies within a second and stays across logins; screen captures then show every app. To go back to granting app by app:
+
+```bash
+echo apps > ~/.config/computer-claude/access-mode
+```
+
+Per app is the default, also when the file is missing or says anything else. The file is yours: Claude has no tool that writes it and is told never to change it, though like any file of yours a shell command could, which Claude Code asks you about first.
+
 This needs extension API 8, so log out and back in once after updating. An older extension keeps working with no access control, and `computer_list` with `kind: "permissions"` then reports `app_access: off`.
 
 ## The agent cursor

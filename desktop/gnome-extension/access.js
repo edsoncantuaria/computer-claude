@@ -1,5 +1,6 @@
 // Which apps the user let Claude use, and the dialog that asks.
 import Clutter from "gi://Clutter"
+import Gio from "gi://Gio"
 import GLib from "gi://GLib"
 import Shell from "gi://Shell"
 
@@ -9,6 +10,35 @@ import * as ModalDialog from "resource:///org/gnome/shell/ui/modalDialog.js"
 // What the user let Claude do, by app. It lives in the module so it survives the shell disabling
 // the extension on the lock screen, and it is gone at logout. Only the dialog below adds to it.
 export const grants = new Map()
+// The user can turn the per-app question off for good: a file that holds the word "all" gives
+// Claude every app, with full control. Nothing in this service writes it; it is theirs to edit.
+const MODE_FILE = Gio.File.new_for_path(
+  GLib.build_filenamev([GLib.get_user_config_dir(), "computer-claude", "access-mode"])
+)
+let allApps = false
+let modeReadAt = 0
+
+// Read again at most once a second, so a change applies at once without a read for every check.
+function allowsAllApps() {
+  const now = GLib.get_monotonic_time()
+  if (now - modeReadAt > 1_000_000) {
+    modeReadAt = now
+    try {
+      const [, contents] = MODE_FILE.load_contents(null)
+      allApps = new TextDecoder().decode(contents).trim() === "all"
+    } catch {
+      // No file, or an unreadable one: ask per app.
+      allApps = false
+    }
+  }
+  return allApps
+}
+
+export const accessMode = () => (allowsAllApps() ? "all" : "apps")
+
+// What Claude may do with an app: "" for nothing.
+export const tierOf = (key) => (allowsAllApps() ? "full" : (grants.get(key) ?? ""))
+
 export const TIERS = { read: 1, click: 2, full: 3 }
 export const TIER_TEXT = {
   read: "see it only",

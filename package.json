@@ -1,6 +1,6 @@
 {
   "name": "computer-claude",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "description": "Computer Use for Claude Code on GNOME Wayland: screenshots, element trees, clicks, typing, keys, scrolling, drags, windows, apps, and clipboard.",
   "homepage": "https://github.com/edsoncantuaria/computer-claude#readme",

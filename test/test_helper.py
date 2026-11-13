@@ -116,6 +116,20 @@ class Clicks(unittest.TestCase):
             self.assertEqual(raised.exception.code, "ACCESS_TIER")
 
 
+class AccessMode(unittest.TestCase):
+    def test_a_user_who_allows_every_app_is_told_apart_from_per_app_grants(self):
+        desktop = FakeDesktop([])
+        desktop.api, desktop.all_apps = helper.ACCESS_API, False
+        desktop.grants = lambda: {}
+        desktop.call = lambda *_args: None
+        self.assertIn("No app is granted yet", helper.command_access(desktop, ["list"], {})[1])
+        self.assertEqual(helper.command_access(desktop, ["revoke"], {})[1], "All access was revoked.")
+        desktop.all_apps = True
+        data, summary = helper.command_access(desktop, ["list"], {})
+        self.assertEqual((data["mode"], summary), ("all", helper.ALL_APPS_NOTE))
+        self.assertIn("Only they can change that", helper.command_access(desktop, ["revoke"], {})[1])
+
+
 class Elements(unittest.TestCase):
     def test_an_exact_label_beats_one_that_only_contains_the_text(self):
         elements = [
