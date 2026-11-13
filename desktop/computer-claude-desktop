@@ -191,8 +191,10 @@ class Desktop:
         try:
             result = self.proxy.call_sync(method, parameters, Gio.DBusCallFlags.NONE, 20_000, None)
         except GLib.Error as error:
-            Gio.DBusError.strip_remote_error(error)
+            # strip_remote_error edits the C struct but not the Python copy of the message.
             message = error.message
+            if message.startswith("GDBus.Error:") and ": " in message:
+                message = message.split(": ", 1)[1]
             code, separator, rest = message.partition(": ")
             if separator and code.isupper() and " " not in code:
                 raise Fail(code, rest) from None
