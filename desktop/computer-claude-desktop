@@ -37,6 +37,9 @@ OBJECT_PATH = "/io/github/edsoncantuaria/ComputerClaude"
 INTERFACE = "io.github.edsoncantuaria.ComputerClaude"
 SUPPORTED_API = 4  # the oldest extension this helper can drive
 CURSOR_API = 5  # first extension that draws the agent cursor
+HALT_API = 6  # first extension with the user's emergency stop (Super+Ctrl+Esc)
+# Commands that act on the desktop; reading (see, screen) keeps working while paused.
+ACTING_COMMANDS = {"click", "type", "press", "scroll", "drag", "move", "hold", "clipboard", "app", "window"}
 
 SNAPSHOT_LIMIT = 64
 ELEMENT_TIME_BUDGET_S = 4.0
@@ -173,8 +176,10 @@ class Desktop:
                 "The Computer Claude GNOME Shell extension is not running. "
                 "Run /computer-claude:setup in Claude Code, then log out and back in.",
             )
-        api = json.loads(self.call("Ping")).get("api")
+        info = json.loads(self.call("Ping"))
+        api = info.get("api")
         self.api = api if isinstance(api, int) else 0
+        self.halted = self.api >= HALT_API and bool(info.get("halted"))
         if self.api < SUPPORTED_API:
             raise Fail(
                 "DESKTOP_EXTENSION_OUTDATED",
@@ -1878,7 +1883,14 @@ def main(argv):
         elif command == "jpeg":
             data, summary = command_jpeg(positional[1:])
         elif command in COMMANDS:
-            data, summary = COMMANDS[command](Desktop(), positional[1:], options)
+            desktop = Desktop()
+            # AT-SPI actions never reach the extension, so the pause is enforced here as well.
+            if desktop.halted and command in ACTING_COMMANDS:
+                raise Fail(
+                    "HALTED",
+                    "The user paused Claude with Super+Ctrl+Esc. Do not retry; wait until the user resumes.",
+                )
+            data, summary = COMMANDS[command](desktop, positional[1:], options)
         else:
             raise Fail("INVALID_ARGUMENTS", f"Unknown command {command!r}.")
         envelope = {"success": True, "data": data, "summary": summary}

@@ -22,12 +22,32 @@ import * as Main from "resource:///org/gnome/shell/ui/main.js"
 const BUS_NAME = "io.github.edsoncantuaria.ComputerClaude"
 const OBJECT_PATH = "/io/github/edsoncantuaria/ComputerClaude"
 const ERROR_NAME = "io.github.edsoncantuaria.ComputerClaude.Error"
-const API_VERSION = 5
+const API_VERSION = 6
 
 const INTERFACE = `
 <node>
   <interface name="io.github.edsoncantuaria.ComputerClaude">
     <method name="Ping"><arg type="s" direction="out"/></method>
+    <method name="Halted"><arg type="b" direction="out"/></method>
+    <method name="WindowPointer">
+      <arg type="t" name="id" direction="in"/>
+      <arg type="d" name="x" direction="in"/>
+      <arg type="d" name="y" direction="in"/>
+      <arg type="u" name="button" direction="in"/>
+      <arg type="b" name="pressed" direction="in"/>
+    </method>
+    <method name="WindowScroll">
+      <arg type="t" name="id" direction="in"/>
+      <arg type="d" name="x" direction="in"/>
+      <arg type="d" name="y" direction="in"/>
+      <arg type="s" name="direction" direction="in"/>
+      <arg type="u" name="steps" direction="in"/>
+    </method>
+    <method name="WindowKey">
+      <arg type="t" name="id" direction="in"/>
+      <arg type="u" name="keyval" direction="in"/>
+      <arg type="b" name="pressed" direction="in"/>
+    </method>
     <method name="ListWindows"><arg type="s" direction="out"/></method>
     <method name="ListMonitors"><arg type="s" direction="out"/></method>
     <method name="WindowAction">
@@ -135,6 +155,11 @@ const FRAME_MS = 16
 // Claude's orange.
 const ORANGE = "rgba(217, 119, 87, ALPHA)"
 const color = (alpha) => ORANGE.replace("ALPHA", String(alpha))
+
+// The user's emergency stop. While it is on, nothing can act on the desktop; reading still works.
+const HALT_ACCELERATOR = "<Control><Super>Escape"
+const HALT_MESSAGE =
+  "HALTED: The user paused Claude with Super+Ctrl+Esc. Do not retry; wait until the user resumes."
 
 function rectangle(rect) {
   return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
@@ -386,6 +411,34 @@ class AgentCursor {
   }
 }
 
+// A pill at the top of the screen that says the emergency stop is on.
+class HaltBadge {
+  constructor() {
+    this._label = new St.Label({
+      text: "Claude paused · Super+Ctrl+Esc to resume",
+      style:
+        "background-color: rgba(28, 28, 28, 0.94); color: white; font-weight: bold; " +
+        `border: 2px solid ${color(1)}; border-radius: 999px; padding: 6px 18px;`,
+      reactive: false,
+      visible: false,
+    })
+    Main.layoutManager.addTopChrome(this._label)
+  }
+
+  setVisible(visible) {
+    this._label.visible = visible
+    if (!visible) return
+    const monitor = Main.layoutManager.primaryMonitor
+    const width = this._label.get_preferred_width(-1)[1]
+    this._label.set_position(Math.round(monitor.x + (monitor.width - width) / 2), monitor.y + 8)
+  }
+
+  destroy() {
+    Main.layoutManager.removeChrome(this._label)
+    this._label.destroy()
+  }
+}
+
 class DesktopService {
   constructor() {
     const seat = Clutter.get_default_backend().get_default_seat()
@@ -393,20 +446,69 @@ class DesktopService {
     this._keyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE)
     this._tracker = Shell.WindowTracker.get_default()
     this._agent = new AgentCursor()
+    this._badge = new HaltBadge()
     this._held = new Map()
     this._holdTimer = 0
+    this._halted = false
+    // A compositor-level shortcut works whichever window has the focus. Synthetic keys can
+    // trigger it too, which is harmless: while paused the service refuses every key, so the
+    // agent can pause itself but never resume itself.
+    this._acceleratorId = global.display.grab_accelerator(
+      HALT_ACCELERATOR,
+      Meta.KeyBindingFlags.NONE
+    )
+    if (this._acceleratorId === 0)
+      console.warn(`Computer Claude: ${HALT_ACCELERATOR} is already taken`)
+    // The shell blocks a grabbed accelerator in every mode until it is allowed, lock screen included.
+    else
+      Main.wm.allowKeybinding(
+        Meta.external_binding_name_for_action(this._acceleratorId),
+        Shell.ActionMode.ALL
+      )
+    this._acceleratorSignal = global.display.connect(
+      "accelerator-activated",
+      (_display, action) => {
+        if (action === this._acceleratorId) this._setHalted(!this._halted)
+      }
+    )
   }
 
   destroy() {
+    global.display.disconnect(this._acceleratorSignal)
+    if (this._acceleratorId !== 0) global.display.ungrab_accelerator(this._acceleratorId)
     this.ReleaseHeld()
     this._agent.destroy()
     this._agent = null
+    this._badge.destroy()
+    this._badge = null
     this._pointer = null
     this._keyboard = null
   }
 
+  _setHalted(halted) {
+    this._halted = halted
+    if (halted) {
+      this.ReleaseHeld()
+      this._agent.hide()
+    }
+    this._badge.setVisible(halted)
+  }
+
+  _guard() {
+    if (this._halted) throw new Error(HALT_MESSAGE)
+  }
+
   Ping() {
-    return JSON.stringify({ api: API_VERSION, shell: Config.PACKAGE_VERSION })
+    return JSON.stringify({
+      api: API_VERSION,
+      shell: Config.PACKAGE_VERSION,
+      halted: this._halted,
+      halt_shortcut: this._acceleratorId !== 0,
+    })
+  }
+
+  Halted() {
+    return this._halted
   }
 
   ListWindows() {
@@ -455,6 +557,7 @@ class DesktopService {
   }
 
   WindowAction(id, action, geometry) {
+    this._guard()
     const window = findWindow(id)
     const frame = window.get_frame_rect()
     switch (action) {
@@ -582,6 +685,7 @@ class DesktopService {
   }
 
   PointerMove(x, y) {
+    this._guard()
     this._pointer.notify_absolute_motion(GLib.get_monotonic_time(), x, y)
     this._agent.moveTo(x, y)
   }
@@ -589,6 +693,10 @@ class DesktopService {
   // Shows where the agent is about to act, for actions that never touch the real pointer.
   // The call returns once the arrow has arrived, so the action happens where the user is looking.
   AgentCursorAsync([x, y, action, label], invocation) {
+    if (this._halted) {
+      invocation.return_dbus_error(ERROR_NAME, HALT_MESSAGE)
+      return
+    }
     this._agent.moveTo(x, y, {
       label,
       click: action === "click",
@@ -598,6 +706,7 @@ class DesktopService {
 
   // A system dialog or the lock screen takes all input away from applications.
   Hold(kind, code, pressed) {
+    this._guard()
     if (kind !== "key" && kind !== "button") throw new Error(`INVALID_HOLD: Unknown kind ${kind}.`)
     if (kind === "key") this.Key(code, pressed)
     else this.PointerButton(code, pressed)
@@ -617,9 +726,10 @@ class DesktopService {
   ReleaseHeld() {
     if (this._holdTimer) GLib.source_remove(this._holdTimer)
     this._holdTimer = 0
+    // Releasing must work while paused, so it skips the guard on purpose.
     for (const { kind, code } of this._held.values()) {
-      if (kind === "key") this.Key(code, false)
-      else this.PointerButton(code, false)
+      if (kind === "key") this._key(code, false)
+      else this._button(code, false)
     }
     this._held.clear()
   }
@@ -639,6 +749,7 @@ class DesktopService {
   }
 
   PointerRelative(dx, dy) {
+    this._guard()
     this._pointer.notify_relative_motion(GLib.get_monotonic_time(), dx, dy)
   }
 
@@ -653,6 +764,11 @@ class DesktopService {
   }
 
   PointerButton(button, pressed) {
+    this._guard()
+    this._button(button, pressed)
+  }
+
+  _button(button, pressed) {
     if (pressed) this._agent.ripple(...global.get_pointer())
     this._pointer.notify_button(
       GLib.get_monotonic_time(),
@@ -662,6 +778,7 @@ class DesktopService {
   }
 
   Scroll(direction, steps) {
+    this._guard()
     if (!(direction in SCROLL_DIRECTIONS))
       throw new Error(`INVALID_DIRECTION: Unknown scroll direction ${direction}.`)
     for (let step = 0; step < steps; step++) {
@@ -674,6 +791,7 @@ class DesktopService {
   }
 
   ScrollContinuous(dx, dy, finish) {
+    this._guard()
     const flags = finish
       ? Clutter.ScrollFinishFlags.HORIZONTAL | Clutter.ScrollFinishFlags.VERTICAL
       : Clutter.ScrollFinishFlags.NONE
@@ -687,11 +805,77 @@ class DesktopService {
   }
 
   Key(keyval, pressed) {
+    this._guard()
+    this._key(keyval, pressed)
+  }
+
+  _key(keyval, pressed) {
     this._keyboard.notify_keyval(
       GLib.get_monotonic_time(),
       keyval,
       pressed ? Clutter.KeyState.PRESSED : Clutter.KeyState.RELEASED
     )
+  }
+
+  // Input scoped to one window, for callers that must never act outside it (a remote view of a
+  // single window, say). The point is relative to the window's frame, and it is refused unless
+  // that exact spot belongs to the window, so an overlapping window cannot receive the input.
+  _pointInWindow(id, x, y) {
+    const window = findWindow(id)
+    if (window.minimized)
+      throw new Error(`WINDOW_MINIMIZED: Window ${id} is minimized; restore it first.`)
+    const frame = window.get_frame_rect()
+    if (x < 0 || y < 0 || x >= frame.width || y >= frame.height)
+      throw new Error(`OUT_OF_WINDOW: ${x},${y} is outside window ${id}.`)
+    const belongs = () => {
+      const owned = new Set(
+        [window, ...popupsOf(window)].map((item) => item.get_compositor_private())
+      )
+      for (
+        let actor = global.stage.get_actor_at_pos(
+          Clutter.PickMode.REACTIVE,
+          frame.x + x,
+          frame.y + y
+        );
+        actor;
+        actor = actor.get_parent()
+      )
+        if (owned.has(actor)) return true
+      return false
+    }
+    if (!belongs()) {
+      Main.activateWindow(window)
+      if (!belongs())
+        throw new Error(`WINDOW_OBSCURED: Something else covers that point of window ${id}.`)
+    }
+    return [frame.x + x, frame.y + y]
+  }
+
+  WindowPointer(id, x, y, button, pressed) {
+    this._guard()
+    const [absoluteX, absoluteY] = this._pointInWindow(id, x, y)
+    this.PointerMove(absoluteX, absoluteY)
+    if (button !== 0) this.PointerButton(button, pressed)
+  }
+
+  WindowScroll(id, x, y, direction, steps) {
+    this._guard()
+    const [absoluteX, absoluteY] = this._pointInWindow(id, x, y)
+    this.PointerMove(absoluteX, absoluteY)
+    this.Scroll(direction, steps)
+  }
+
+  // Keys go to whichever window has the focus, so the window must have it already.
+  WindowKey(id, keyval, pressed) {
+    this._guard()
+    const window = findWindow(id)
+    if (global.display.focus_window?.find_root_ancestor() !== window) {
+      Main.activateWindow(window)
+      throw new Error(
+        `WINDOW_NOT_FOCUSED: Window ${id} was brought to the front; send the key again.`
+      )
+    }
+    this.Key(keyval, pressed)
   }
 
   KeyboardGroup() {
@@ -700,17 +884,20 @@ class DesktopService {
 
   // Text delivered through the input method needs no key for any character.
   CommitText(text) {
+    this._guard()
     if (!Main.inputMethod.currentFocus) return false
     Main.inputMethod.commit(text)
     return true
   }
 
   SetClipboard(text) {
+    this._guard()
     St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text)
   }
 
   // Launching from the shell gives the app the same session context as the dash.
   LaunchApp(desktopId, uris) {
+    this._guard()
     const app = Shell.AppSystem.get_default().lookup_app(desktopId)
     if (!app) throw new Error(`APP_NOT_FOUND: No installed application has ID ${desktopId}.`)
     if (uris.length > 0)

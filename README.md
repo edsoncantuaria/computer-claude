@@ -71,6 +71,12 @@ While Claude acts, an orange cursor labelled "Claude" glides to where the action
 
 An extension older than v0.3.0 keeps working but draws only a dot for real pointer moves; log out and back in once after updating to get the full cursor.
 
+## Emergency stop
+
+Press **Super+Ctrl+Esc** and Claude stops at once, whichever window has the focus. Every action fails with `HALTED` and a "Claude paused" pill shows at the top of the screen; looking (screenshots, element trees) still works. Press the same keys again to resume. Held keys and buttons are released when you pause.
+
+The switch lives in the GNOME Shell extension, not in the plugin, so it works even if Claude Code hangs. Claude can pause itself with those keys but never resume itself: while paused the extension refuses every key it is sent. Needs extension API 6 (v0.4.0), so log out and back in once after updating. If another program already uses the shortcut, the extension still works without it and `Ping` reports `halt_shortcut: false`.
+
 ## How it works
 
 | Part | Role |
@@ -94,7 +100,7 @@ The extension exists because GNOME Shell denies window introspection and screens
 
 ## Trust boundary
 
-Any process on your session bus can call the extension's service, which means it can read the screen and inject input. That is the same trust domain as the desktop session itself; sandboxed (Flatpak) apps cannot reach it unless granted session-bus access. Screenshots are only written inside your runtime directory.
+Any process on your session bus can call the extension's service, which means it can read the screen and inject input. For callers that must stay inside one window (a remote view of a single window, say), the service also offers `WindowPointer`, `WindowScroll` and `WindowKey`: pointer points are relative to the window and refused unless that exact spot belongs to the window, and keys require the window to have the focus. That is the same trust domain as the desktop session itself; sandboxed (Flatpak) apps cannot reach it unless granted session-bus access. Screenshots are only written inside your runtime directory.
 
 Claude acts on your real desktop with your permissions. Claude Code asks before each tool call unless you allow the tools; keep it that way for anything you would not hand to someone sitting at your keyboard. To skip the prompt only for tools that look and never act, add this to `permissions.allow` in your Claude Code settings:
 
