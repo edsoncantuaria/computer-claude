@@ -6,11 +6,13 @@
 // bus; desktop/computer-claude-desktop composes them into Computer Use actions.
 //
 // Any process on the user's session bus can call this service. That is the same
-// trust domain as the user's own desktop session.
+// trust domain as the user's own desktop session. Apps are still off limits until
+// the user grants them in a dialog only the shell can draw (see RequestAccess).
 import Clutter from "gi://Clutter"
 import Gio from "gi://Gio"
 import GLib from "gi://GLib"
 import Meta from "gi://Meta"
+import Mtk from "gi://Mtk"
 import Shell from "gi://Shell"
 import St from "gi://St"
 
@@ -18,11 +20,13 @@ import { Extension } from "resource:///org/gnome/shell/extensions/extension.js"
 import * as Config from "resource:///org/gnome/shell/misc/config.js"
 import { getKeyboardManager } from "resource:///org/gnome/shell/misc/keyboardManager.js"
 import * as Main from "resource:///org/gnome/shell/ui/main.js"
+import { accessKey, askAccess, describeApp, grants, SHELL_KEY, TIER_TEXT, TIERS } from "./access.js"
+import { AgentCursor, HaltBadge } from "./overlay.js"
 
 const BUS_NAME = "io.github.edsoncantuaria.ComputerClaude"
 const OBJECT_PATH = "/io/github/edsoncantuaria/ComputerClaude"
 const ERROR_NAME = "io.github.edsoncantuaria.ComputerClaude.Error"
-const API_VERSION = 7
+const API_VERSION = 8
 
 const INTERFACE = `
 <node>
@@ -116,6 +120,13 @@ const INTERFACE = `
       <arg type="s" name="desktop_id" direction="in"/>
       <arg type="as" name="uris" direction="in"/>
     </method>
+    <method name="Access"><arg type="s" direction="out"/></method>
+    <method name="RequestAccess">
+      <arg type="as" name="keys" direction="in"/>
+      <arg type="s" name="reason" direction="in"/>
+      <arg type="s" direction="out"/>
+    </method>
+    <method name="RevokeAccess"/>
   </interface>
 </node>`
 
@@ -141,23 +152,12 @@ const POPUP_WINDOW_TYPES = new Set([
   Meta.WindowType.COMBO,
 ])
 
+// Surfaces that belong to the desktop itself (its icons, a dock), not to an app one could grant.
+const UNOWNED_WINDOW_TYPES = new Set([Meta.WindowType.DESKTOP, Meta.WindowType.DOCK])
+
 // Held input is released on its own if the caller goes away.
 const HOLD_LIMIT_MS = 30_000
 const MAX_WORKSPACE_INDEX = 35
-
-// The agent's own cursor: it shows where Claude is acting, whether or not it moves the real pointer.
-const CURSOR_LINGER_MS = 1800
-// A long-running action keeps its label up this long at most if its end is never reported.
-const CURSOR_BUSY_MAX_MS = 30_000
-const CURSOR_FADE_MS = 350
-const CURSOR_TRAVEL_MS = [140, 420]
-const CURSOR_PX_PER_MS = 1.6
-const TRAIL_SPACING_PX = 5
-const TRAIL_FADE_MS = 800
-const FRAME_MS = 16
-// Claude's orange.
-const ORANGE = "rgba(217, 119, 87, ALPHA)"
-const color = (alpha) => ORANGE.replace("ALPHA", String(alpha))
 
 // The user's emergency stop. While it is on, nothing can act on the desktop; reading still works.
 const HALT_ACCELERATOR = "<Control><Super>Escape"
@@ -217,255 +217,6 @@ function unmaximize(window) {
   else window.unmaximize()
 }
 
-class AgentCursor {
-  constructor() {
-    this._layer = new St.Widget({ reactive: false, visible: false, opacity: 0 })
-    // Claude's own pointer: a hollow white arrowhead, tip at the top left, like the one Claude in
-    // Chrome draws. A thin dark rim keeps it visible on white backgrounds.
-    this._arrow = new St.DrawingArea({ width: 28, height: 28, reactive: false })
-    this._arrow.connect("repaint", (area) => {
-      const cr = area.get_context()
-      cr.setLineJoin(1) // round
-      cr.setLineCap(1)
-      cr.moveTo(4.4, 4.4)
-      cr.lineTo(20.6, 11)
-      cr.lineTo(13.9, 12.9)
-      cr.lineTo(11.6, 20.6)
-      cr.closePath()
-      cr.setSourceRGBA(0, 0, 0, 0.5)
-      cr.setLineWidth(3.6)
-      cr.strokePreserve()
-      cr.setSourceRGBA(0.78, 0.39, 0.26, 0.3)
-      cr.fillPreserve()
-      cr.setSourceRGBA(1, 1, 1, 1)
-      cr.setLineWidth(1.8)
-      cr.stroke()
-      cr.$dispose()
-    })
-    // A flat orange pill that names what Claude is doing right now.
-    this._label = new St.Label({
-      text: "Claude",
-      style:
-        "background-color: rgb(192, 99, 65); color: rgb(255, 244, 236); " +
-        "font-size: 12px; font-weight: 500; border-radius: 999px; padding: 4px 14px; " +
-        "box-shadow: 0 1px 5px rgba(0, 0, 0, 0.3);",
-    })
-    this._layer.add_child(this._arrow)
-    this._layer.add_child(this._label)
-    Main.uiGroup.add_child(this._layer)
-    this._x = null
-    this._y = null
-    this._tween = 0
-    this._linger = 0
-    this._pending = null
-    this._sticky = false
-    this._trail = new Set()
-  }
-
-  destroy() {
-    this.hide()
-    this._layer.destroy()
-    this._layer = null
-  }
-
-  // Moves the arrow along an eased path, leaving a fading trail. `done` runs on arrival.
-  // `label` names the action; left out, the previous one stays. `sticky` keeps the arrow and its
-  // label on screen until idle() (the action is still running), with a cap in case that never comes.
-  moveTo(x, y, { label, click = false, done = null, sticky = false } = {}) {
-    this._stopTween()
-    this._pending = done
-    this._sticky = sticky
-    this._setLabel(label)
-    this._reveal()
-    const fromX = this._x ?? x
-    const fromY = this._y ?? y
-    const distance = Math.hypot(x - fromX, y - fromY)
-    const duration = Math.min(
-      CURSOR_TRAVEL_MS[1],
-      Math.max(CURSOR_TRAVEL_MS[0], distance / CURSOR_PX_PER_MS)
-    )
-    const started = GLib.get_monotonic_time()
-    let lastDot = [fromX, fromY]
-    const step = () => {
-      const t = Math.min((GLib.get_monotonic_time() - started) / 1000 / duration, 1)
-      const eased = 1 - (1 - t) ** 3
-      this._place(fromX + (x - fromX) * eased, fromY + (y - fromY) * eased)
-      if (Math.hypot(this._x - lastDot[0], this._y - lastDot[1]) >= TRAIL_SPACING_PX) {
-        this._dot(this._x, this._y)
-        lastDot = [this._x, this._y]
-      }
-      if (t < 1) return GLib.SOURCE_CONTINUE
-      this._tween = 0
-      if (click) this._ripple(x, y)
-      this._scheduleFade(this._sticky ? CURSOR_BUSY_MAX_MS : CURSOR_LINGER_MS)
-      this._settle()
-      return GLib.SOURCE_REMOVE
-    }
-    this._tween = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FRAME_MS, step)
-  }
-
-  // The action ended: let the arrow and its label fade out.
-  idle() {
-    this._sticky = false
-    if (this._layer.visible && !this._tween) this._scheduleFade(CURSOR_LINGER_MS)
-  }
-
-  ripple(x, y) {
-    if (this._layer.visible) this._ripple(x, y)
-  }
-
-  // Gone at once, as screenshots must not show the agent's own overlay.
-  hide() {
-    this._stopTween()
-    if (this._linger) GLib.source_remove(this._linger)
-    this._linger = 0
-    for (const dot of this._trail) dot.destroy()
-    this._trail.clear()
-    this._layer.remove_all_transitions()
-    this._layer.opacity = 0
-    this._layer.hide()
-  }
-
-  // A caller waiting for the arrow must never be left hanging by a newer move or a hide.
-  _stopTween() {
-    if (this._tween) GLib.source_remove(this._tween)
-    this._tween = 0
-    this._settle()
-  }
-
-  _settle() {
-    const done = this._pending
-    this._pending = null
-    if (done) done()
-  }
-
-  _reveal() {
-    if (this._linger) GLib.source_remove(this._linger)
-    this._linger = 0
-    Main.uiGroup.set_child_above_sibling(this._layer, null)
-    this._layer.show()
-    this._layer.remove_all_transitions()
-    this._layer.ease({ opacity: 255, duration: 90, mode: Clutter.AnimationMode.EASE_OUT_QUAD })
-  }
-
-  _scheduleFade(delay = CURSOR_LINGER_MS) {
-    if (this._linger) GLib.source_remove(this._linger)
-    this._linger = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
-      this._linger = 0
-      this._layer.ease({
-        opacity: 0,
-        duration: CURSOR_FADE_MS,
-        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        onComplete: () => {
-          if (this._layer && this._layer.opacity === 0) this._layer.hide()
-        },
-      })
-      return GLib.SOURCE_REMOVE
-    })
-  }
-
-  _setLabel(label) {
-    if (label !== undefined) this._label.text = label || "Claude"
-  }
-
-  _place(x, y) {
-    this._x = x
-    this._y = y
-    // The arrow's tip is at (4.4, 4.4) in its own space.
-    this._arrow.set_position(Math.round(x - 4), Math.round(y - 4))
-    // The label sits below and to the right of the arrow, and flips to stay on its screen.
-    const monitor =
-      Main.layoutManager.monitors.find(
-        (m) => x >= m.x && x < m.x + m.width && y >= m.y && y < m.y + m.height
-      ) ?? Main.layoutManager.primaryMonitor
-    const [, width] = this._label.get_preferred_width(-1)
-    const [, height] = this._label.get_preferred_height(-1)
-    let labelX = x + 28
-    let labelY = y + 5
-    if (labelX + width > monitor.x + monitor.width - 8) labelX = x - 8 - width
-    if (labelY + height > monitor.y + monitor.height - 8) labelY = y - 8 - height
-    this._label.set_position(Math.round(labelX), Math.round(labelY))
-  }
-
-  _dot(x, y) {
-    const size = 11
-    const dot = new St.Widget({
-      reactive: false,
-      width: size,
-      height: size,
-      style: `background-color: ${color(0.9)}; border-radius: ${size}px; box-shadow: 0 0 9px ${color(0.8)};`,
-    })
-    dot.set_pivot_point(0.5, 0.5)
-    dot.set_position(Math.round(x - size / 2), Math.round(y - size / 2))
-    this._layer.insert_child_below(dot, this._arrow)
-    this._trail.add(dot)
-    dot.ease({
-      opacity: 0,
-      scale_x: 0.2,
-      scale_y: 0.2,
-      duration: TRAIL_FADE_MS,
-      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-      onComplete: () => {
-        this._trail.delete(dot)
-        dot.destroy()
-      },
-    })
-  }
-
-  _ripple(x, y) {
-    const size = 16
-    const ring = new St.Widget({
-      reactive: false,
-      width: size,
-      height: size,
-      style: `border: 3px solid ${color(0.95)}; border-radius: ${size}px; box-shadow: 0 0 8px ${color(0.7)};`,
-    })
-    ring.set_pivot_point(0.5, 0.5)
-    ring.set_position(Math.round(x - size / 2), Math.round(y - size / 2))
-    this._layer.insert_child_below(ring, this._arrow)
-    this._trail.add(ring)
-    ring.ease({
-      opacity: 0,
-      scale_x: 3.5,
-      scale_y: 3.5,
-      duration: 750,
-      mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-      onComplete: () => {
-        this._trail.delete(ring)
-        ring.destroy()
-      },
-    })
-  }
-}
-
-// A pill at the top of the screen that says the emergency stop is on.
-class HaltBadge {
-  constructor() {
-    this._label = new St.Label({
-      text: "Claude paused · Super+Ctrl+Esc to resume",
-      style:
-        "background-color: rgba(28, 28, 28, 0.94); color: white; font-weight: bold; " +
-        `border: 2px solid ${color(1)}; border-radius: 999px; padding: 6px 18px;`,
-      reactive: false,
-      visible: false,
-    })
-    Main.layoutManager.addTopChrome(this._label)
-  }
-
-  setVisible(visible) {
-    this._label.visible = visible
-    if (!visible) return
-    const monitor = Main.layoutManager.primaryMonitor
-    const width = this._label.get_preferred_width(-1)[1]
-    this._label.set_position(Math.round(monitor.x + (monitor.width - width) / 2), monitor.y + 8)
-  }
-
-  destroy() {
-    Main.layoutManager.removeChrome(this._label)
-    this._label.destroy()
-  }
-}
-
 class DesktopService {
   constructor() {
     const seat = Clutter.get_default_backend().get_default_seat()
@@ -477,6 +228,7 @@ class DesktopService {
     this._held = new Map()
     this._holdTimer = 0
     this._halted = false
+    this._asking = false
     // A compositor-level shortcut works whichever window has the focus. Synthetic keys can
     // trigger it too, which is harmless: while paused the service refuses every key, so the
     // agent can pause itself but never resume itself.
@@ -523,6 +275,44 @@ class DesktopService {
 
   _guard() {
     if (this._halted) throw new Error(HALT_MESSAGE)
+    // The answer to an access request must be the user's own.
+    if (this._asking)
+      throw new Error(
+        "ACCESS_PROMPT_OPEN: The user is being asked for access; wait for the answer."
+      )
+  }
+
+  _require(key, need) {
+    const tier = grants.get(key)
+    if (tier && TIERS[tier] >= TIERS[need]) return
+    const { name } = describeApp(key)
+    if (!tier)
+      throw new Error(
+        `APP_NOT_GRANTED: ${name} has not been granted to Claude. Ask the user with computer_access.`
+      )
+    throw new Error(
+      `ACCESS_TIER: ${name} is granted "${tier}" access (${TIER_TEXT[tier]}), and this needs "${need}".`
+    )
+  }
+
+  // Keys go to the focused window, or to the shell while it shows a dialog, a menu or the overview.
+  _keyboardTarget() {
+    if (Main.modalCount > 0 || Main.overview.visible) return SHELL_KEY
+    const window = global.display.focus_window?.find_root_ancestor()
+    return window ? accessKey(window) : SHELL_KEY
+  }
+
+  // Buttons and scrolling go to whatever is under the pointer.
+  _pointerTarget() {
+    const [x, y] = global.get_pointer()
+    for (
+      let actor = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
+      actor;
+      actor = actor.get_parent()
+    )
+      if (actor instanceof Meta.WindowActor)
+        return accessKey(actor.meta_window.find_root_ancestor())
+    return SHELL_KEY
   }
 
   Ping() {
@@ -531,6 +321,7 @@ class DesktopService {
       shell: Config.PACKAGE_VERSION,
       halted: this._halted,
       halt_shortcut: this._acceleratorId !== 0,
+      asking: this._asking,
     })
   }
 
@@ -552,6 +343,8 @@ class DesktopService {
           wm_class: window.get_wm_class() ?? "",
           app: app?.get_name() ?? "",
           app_id: app?.get_id() ?? "",
+          access_key: accessKey(window),
+          access: grants.get(accessKey(window)) ?? "",
           ...rectangle(window.get_frame_rect()),
           // An open menu holds the focus on behalf of its window.
           focused: global.display.focus_window?.find_root_ancestor() === window,
@@ -586,6 +379,8 @@ class DesktopService {
   WindowAction(id, action, geometry) {
     this._guard()
     const window = findWindow(id)
+    // Focusing is free, as focus has to go back to the user's window after a borrowed action.
+    if (action !== "focus") this._require(accessKey(window), action === "close" ? "full" : "read")
     const frame = window.get_frame_rect()
     switch (action) {
       case "focus":
@@ -658,30 +453,23 @@ class DesktopService {
         if (id >= global.display.get_n_monitors())
           throw new Error(`SCREEN_NOT_FOUND: No screen has index ${id}.`)
         const bounds = rectangle(global.display.get_monitor_geometry(id))
-        await new Shell.Screenshot().screenshot_area(
-          bounds.x,
-          bounds.y,
-          bounds.width,
-          bounds.height,
-          stream
-        )
+        await this._captureStage(bounds, global.display.get_monitor_scale(id), stream)
         return bounds
       }
       if (kind !== "window") throw new Error(`INVALID_TARGET: Unknown screenshot kind ${kind}.`)
 
       // Painting the actor captures the window even when it is covered by others.
       const window = findWindow(id)
+      this._require(accessKey(window), "read")
       const popups = popupsOf(window)
       if (popups.length > 0) {
         // Popups are separate surfaces, so only a stage capture shows them with their window.
         const bounds = unionRectangle(
           [window, ...popups].map((item) => rectangle(item.get_frame_rect()))
         )
-        await new Shell.Screenshot().screenshot_area(
-          bounds.x,
-          bounds.y,
-          bounds.width,
-          bounds.height,
+        await this._captureStage(
+          bounds,
+          global.display.get_monitor_scale(window.get_monitor()),
           stream
         )
         return bounds
@@ -709,6 +497,51 @@ class DesktopService {
     } finally {
       stream.close(null)
     }
+  }
+
+  // Paints part of the desktop without showing it, with every window of an app the user has not
+  // granted drawn black wherever it appears: on the desktop, under a dialog, in the overview.
+  async _captureStage(bounds, scale, stream) {
+    const blackened = global
+      .get_window_actors()
+      .filter((actor) => {
+        const window = actor.meta_window.find_root_ancestor()
+        return !(
+          UNOWNED_WINDOW_TYPES.has(window.get_window_type()) || grants.has(accessKey(window))
+        )
+      })
+      .map((actor) => {
+        const effect = new Clutter.BrightnessContrastEffect()
+        effect.set_brightness(-1)
+        actor.add_effect(effect)
+        return [actor, effect]
+      })
+    let content
+    try {
+      // Off screen and in this same turn, so the user never sees a window go black.
+      content = global.stage.paint_to_content(
+        new Mtk.Rectangle(bounds),
+        scale,
+        null,
+        Clutter.PaintFlag.NO_CURSORS
+      )
+    } finally {
+      for (const [actor, effect] of blackened) actor.remove_effect(effect)
+    }
+    const texture = content.get_texture()
+    await Shell.Screenshot.composite_to_stream(
+      texture,
+      0,
+      0,
+      texture.get_width(),
+      texture.get_height(),
+      scale,
+      null,
+      0,
+      0,
+      1,
+      stream
+    )
   }
 
   PointerMove(x, y) {
@@ -808,6 +641,8 @@ class DesktopService {
 
   PointerButton(button, pressed) {
     this._guard()
+    // Releases always pass, so nothing stays held when access ends mid-action.
+    if (pressed) this._require(this._pointerTarget(), button === 1 ? "click" : "full")
     this._button(button, pressed)
   }
 
@@ -822,6 +657,11 @@ class DesktopService {
 
   Scroll(direction, steps) {
     this._guard()
+    this._require(this._pointerTarget(), "click")
+    this._scroll(direction, steps)
+  }
+
+  _scroll(direction, steps) {
     if (!(direction in SCROLL_DIRECTIONS))
       throw new Error(`INVALID_DIRECTION: Unknown scroll direction ${direction}.`)
     for (let step = 0; step < steps; step++) {
@@ -835,6 +675,7 @@ class DesktopService {
 
   ScrollContinuous(dx, dy, finish) {
     this._guard()
+    this._require(this._pointerTarget(), "click")
     const flags = finish
       ? Clutter.ScrollFinishFlags.HORIZONTAL | Clutter.ScrollFinishFlags.VERTICAL
       : Clutter.ScrollFinishFlags.NONE
@@ -849,6 +690,7 @@ class DesktopService {
 
   Key(keyval, pressed) {
     this._guard()
+    if (pressed) this._require(this._keyboardTarget(), "full")
     this._key(keyval, pressed)
   }
 
@@ -863,6 +705,7 @@ class DesktopService {
   // Input scoped to one window, for callers that must never act outside it (a remote view of a
   // single window, say). The point is relative to the window's frame, and it is refused unless
   // that exact spot belongs to the window, so an overlapping window cannot receive the input.
+  // These carry a person's own input to a window they chose, so app grants do not apply.
   _pointInWindow(id, x, y) {
     const window = findWindow(id)
     if (window.minimized)
@@ -898,14 +741,14 @@ class DesktopService {
     this._guard()
     const [absoluteX, absoluteY] = this._pointInWindow(id, x, y)
     this.PointerMove(absoluteX, absoluteY)
-    if (button !== 0) this.PointerButton(button, pressed)
+    if (button !== 0) this._button(button, pressed)
   }
 
   WindowScroll(id, x, y, direction, steps) {
     this._guard()
     const [absoluteX, absoluteY] = this._pointInWindow(id, x, y)
     this.PointerMove(absoluteX, absoluteY)
-    this.Scroll(direction, steps)
+    this._scroll(direction, steps)
   }
 
   // Keys go to whichever window has the focus, so the window must have it already.
@@ -918,7 +761,7 @@ class DesktopService {
         `WINDOW_NOT_FOCUSED: Window ${id} was brought to the front; send the key again.`
       )
     }
-    this.Key(keyval, pressed)
+    this._key(keyval, pressed)
   }
 
   KeyboardGroup() {
@@ -928,6 +771,7 @@ class DesktopService {
   // Text delivered through the input method needs no key for any character.
   CommitText(text) {
     this._guard()
+    this._require(this._keyboardTarget(), "full")
     if (!Main.inputMethod.currentFocus) return false
     Main.inputMethod.commit(text)
     return true
@@ -943,10 +787,61 @@ class DesktopService {
     this._guard()
     const app = Shell.AppSystem.get_default().lookup_app(desktopId)
     if (!app) throw new Error(`APP_NOT_FOUND: No installed application has ID ${desktopId}.`)
+    // Handing an app a file or an address makes it act, which looking at it does not cover.
+    this._require(desktopId, uris.length > 0 ? "full" : "read")
     if (uris.length > 0)
       app.get_app_info().launch_uris(uris, global.create_app_launch_context(0, -1))
     else if (app.get_n_windows() > 0) app.activate()
     else app.open_new_window(-1)
+  }
+
+  Access() {
+    return JSON.stringify(
+      Object.fromEntries(
+        [...grants].map(([key, tier]) => [key, { name: describeApp(key).name, tier }])
+      )
+    )
+  }
+
+  // Asks the user, in a dialog of the shell's own, to let Claude use some apps.
+  RequestAccessAsync([keys, reason], invocation) {
+    this._requestAccess(keys, reason).then(
+      (result) => invocation.return_value(new GLib.Variant("(s)", [JSON.stringify(result)])),
+      (error) => invocation.return_dbus_error(ERROR_NAME, error.message)
+    )
+  }
+
+  async _requestAccess(keys, reason) {
+    this._guard()
+    if (Main.sessionMode.isLocked)
+      throw new Error("SCREEN_LOCKED: The screen is locked. Ask the user to unlock it.")
+    const entries = [...new Set(keys)].map((key) => ({ key, ...describeApp(key) }))
+    const wanted = entries.filter((entry) => !grants.has(entry.key))
+    if (wanted.length > 0) {
+      this._asking = true
+      this._agent.hide()
+      let answer
+      try {
+        answer = await askAccess(wanted, reason.slice(0, 300))
+      } finally {
+        this._asking = false
+      }
+      if (answer !== "deny")
+        for (const entry of wanted) grants.set(entry.key, answer === "full" ? "full" : entry.tier)
+    }
+    return {
+      granted: Object.fromEntries(
+        entries
+          .filter((entry) => grants.has(entry.key))
+          .map((entry) => [entry.name, grants.get(entry.key)])
+      ),
+      denied: entries.filter((entry) => !grants.has(entry.key)).map((entry) => entry.name),
+    }
+  }
+
+  // Taking access away needs no question.
+  RevokeAccess() {
+    grants.clear()
   }
 }
 

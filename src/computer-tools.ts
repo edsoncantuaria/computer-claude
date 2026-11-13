@@ -1,5 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/server"
 import { z } from "zod"
+import { type BatchTools, registerBatchTool, type ToolContext } from "./batch.js"
 import {
   type DesktopClient,
   DesktopError,
@@ -14,6 +15,13 @@ import {
   registerObservationTools,
   withObservation,
 } from "./observation.js"
+import {
+  checkPointTarget,
+  pointArgs,
+  pointerPosition,
+  pointFields,
+  runPointCommand,
+} from "./pointing.js"
 import type { ToolRegistrar } from "./registrar.js"
 import {
   addTargetArgs,
@@ -23,11 +31,14 @@ import {
   desktopToolError,
   snapshotInput,
   targetFields,
+  timed,
   windowIdInput,
 } from "./tool-shared.js"
 import { asRecord } from "./utils.js"
 
 const KEY_TOKEN_PATTERN = /^[A-Za-z0-9_]+$/u
+/** Longer than the dialog the user answers, which gives up on its own after two minutes. */
+const ACCESS_TIMEOUT_MS = 160_000
 
 const observeAfterField = {
   observe_after: z
@@ -36,10 +47,6 @@ const observeAfterField = {
     .describe(
       "Also return a fresh observation of the target (screenshot, snapshot_id, elements) after acting."
     ),
-}
-
-interface ToolContext {
-  mcpReq: { signal: AbortSignal }
 }
 
 // biome-ignore lint/complexity/noExcessiveLinesPerFunction: Registration stays together so shared schemas and tool contracts remain locally auditable.
@@ -53,7 +60,7 @@ export function registerComputerUseTools(
     config: unknown,
     handler: (input: ActionInput, ctx: ToolContext) => Promise<CallToolResult>
   ) =>
-    Reflect.apply(registerTool, undefined, [
+    Reflect.apply(register, undefined, [
       name,
       config,
       async (input: ActionInput, ctx: ToolContext) => {
@@ -64,17 +71,34 @@ export function registerComputerUseTools(
       // biome-ignore lint/nursery/noUnsafeTypeAssertion: The wrapper keeps the registrar's signature; only the handler is decorated.
     ])) as ToolRegistrar
 
+  /** Keeps each tool's schema and handler as it is registered, for computer_batch. */
+  const tools: BatchTools = new Map()
+  const register = ((
+    name: string,
+    config: { inputSchema: z.ZodType },
+    handler: (input: never, ctx: ToolContext) => Promise<CallToolResult>
+  ) => {
+    const measured = timed(name, handler)
+    tools.set(name, { schema: config.inputSchema, handler: measured })
+    return Reflect.apply(registerTool, undefined, [name, config, measured])
+    // biome-ignore lint/nursery/noUnsafeTypeAssertion: The wrapper keeps the registrar's signature; it only records the call.
+  }) as ToolRegistrar
+
   const listSchema = z.object({
-    kind: z.enum(["apps", "windows", "screens", "permissions"]).default("apps"),
+    kind: z.enum(["apps", "windows", "screens", "permissions", "pointer"]).default("apps"),
     app: appInput.optional().describe("App whose windows to list."),
+    snapshot_id: snapshotInput
+      .optional()
+      .describe("For pointer: also give the position in this snapshot's screenshot pixels."),
     include_hidden: z.boolean().optional(),
     include_background: z.boolean().optional(),
   })
 
-  registerTool(
+  register(
     "computer_list",
     {
-      description: "List apps, windows, screens, or permission status.",
+      description:
+        "List apps (with the access each has), windows, screens, permission status, or where the pointer is.",
       inputSchema: listSchema,
       annotations: {
         readOnlyHint: true,
@@ -83,7 +107,8 @@ export function registerComputerUseTools(
         openWorldHint: false,
       },
     },
-    async ({ kind, app, include_hidden, include_background }, ctx) => {
+    async ({ kind, app, snapshot_id, include_hidden, include_background }, ctx) => {
+      if (kind === "pointer") return pointerPosition(desktop, snapshot_id, ctx.mcpReq.signal)
       let args: string[]
       if (kind === "apps") {
         args = ["app", "list"]
@@ -98,6 +123,45 @@ export function registerComputerUseTools(
         args = ["permissions", "status", "--all-sources"]
       }
       return callDesktop(desktop, args, ctx.mcpReq.signal, `Listed computer ${kind}.`)
+    }
+  )
+
+  register(
+    "computer_access",
+    {
+      description:
+        "Ask the user to let you use apps, list what is granted, or revoke it all. An app must be granted before it can be observed or acted on. The user answers in a desktop dialog, so request every app the task needs in one call and wait. Browsers are granted read-only and terminals and IDEs click-only unless the user chooses full control.",
+      inputSchema: z
+        .object({
+          action: z.enum(["request", "list", "revoke"]).default("list"),
+          apps: z
+            .array(appInput.refine((name) => !name.startsWith("-"), "Not an app name."))
+            .min(1)
+            .max(12)
+            .optional()
+            .describe('Apps to request. "shell" is GNOME Shell itself: top bar, Activities.'),
+          reason: z
+            .string()
+            .max(300)
+            .optional()
+            .describe("One sentence shown in the dialog: why the task needs these apps."),
+        })
+        .superRefine((value, context) => {
+          if (value.action === "request" && value.apps === undefined) {
+            context.addIssue({ code: "custom", message: "apps is required for request." })
+          }
+        }),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ action, apps, reason }, ctx) => {
+      const args = ["access", action, ...(action === "request" ? (apps ?? []) : [])]
+      if (action === "request" && reason) args.push("--reason", reason)
+      return callDesktop(desktop, args, ctx.mcpReq.signal, "Access read.", ACCESS_TIMEOUT_MS)
     }
   )
 
@@ -130,7 +194,7 @@ export function registerComputerUseTools(
       }
     })
 
-  registerTool(
+  register(
     "computer_observe",
     {
       description:
@@ -167,9 +231,9 @@ export function registerComputerUseTools(
     }
   )
 
-  registerObservationTools(registerTool, desktop)
+  registerObservationTools(register, desktop)
 
-  registerTool(
+  register(
     "computer_inspect",
     {
       description:
@@ -215,34 +279,20 @@ export function registerComputerUseTools(
   const clickSchema = z
     .object({
       ...observeAfterField,
-      snapshot_id: snapshotInput,
-      element_id: z.string().min(1).optional(),
-      query: z.string().min(1).optional().describe("Visible label or text."),
-      x: z.number().optional(),
-      y: z.number().optional(),
+      ...pointFields,
       button: z.enum(["left", "right", "middle"]).optional(),
       click_count: z.number().int().min(1).max(3).optional(),
       long_press: z.boolean().optional(),
+      modifiers: z
+        .array(z.enum(["shift", "ctrl", "alt", "super"]))
+        .min(1)
+        .max(4)
+        .optional()
+        .describe("Keys held during the click, such as shift to extend a selection."),
       foreground: z.boolean().optional().describe("Use the physical pointer."),
-      wait_ms: z.number().int().min(0).max(30_000).optional(),
     })
     .superRefine((value, context) => {
-      const hasCoordinates = value.x !== undefined && value.y !== undefined
-      if ((value.x === undefined) !== (value.y === undefined)) {
-        context.addIssue({
-          code: "custom",
-          message: "x and y must be supplied together.",
-        })
-      }
-      const targetCount = [value.element_id, value.query, hasCoordinates ? true : undefined].filter(
-        (item) => item !== undefined
-      ).length
-      if (targetCount !== 1) {
-        context.addIssue({
-          code: "custom",
-          message: "Supply exactly one target: element_id, query, or x and y.",
-        })
-      }
+      checkPointTarget(value, context)
       if (
         value.long_press &&
         ((value.button !== undefined && value.button !== "left") ||
@@ -278,61 +328,47 @@ export function registerComputerUseTools(
         openWorldHint: false,
       },
     },
-    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Click dispatch mirrors the mutually exclusive target modes in the public tool schema.
     async (input, ctx) => {
-      const args = ["click"]
-      let forceForeground = false
-      let localExactWindowTarget: DesktopExactWindowTarget | undefined
-      if (input.element_id) {
-        args.push("--on", input.element_id, "--snapshot", input.snapshot_id)
-      } else if (input.query) {
-        args.push(input.query, "--snapshot", input.snapshot_id)
-      } else {
-        try {
-          if (input.x === undefined || input.y === undefined) {
-            throw new DesktopError("INVALID_TARGET", "Coordinate clicks require both x and y.")
-          }
-          const coordinates = desktop.resolveSnapshotCoordinates(
-            input.snapshot_id,
-            input.x,
-            input.y
-          )
-          args.push("--at", `${coordinates.x},${coordinates.y}`)
-          args.push(...coordinates.targetArgs)
-          if (coordinates.exactWindowTarget) {
-            if (!input.foreground) localExactWindowTarget = coordinates.exactWindowTarget
-          } else {
-            forceForeground = true
-          }
-          if (coordinates.global) {
-            args.push("--global")
-          }
-        } catch (error) {
-          return desktopToolError(error)
-        }
+      try {
+        const target = pointArgs(desktop, input)
+        const args = ["click", ...target.args]
+        if (input.button === "right") args.push("--right")
+        if (input.button === "middle") args.push("--middle")
+        if (input.click_count === 2) args.push("--double")
+        if (input.click_count === 3) args.push("--triple")
+        if (input.long_press) args.push("--long-press")
+        if (input.modifiers) args.push("--modifiers", input.modifiers.join("+"))
+        if (target.foreground) args.push("--foreground")
+        if (input.wait_ms !== undefined) args.push("--wait-for", String(input.wait_ms))
+        return await runPointCommand(desktop, args, target, ctx.mcpReq.signal, "Click completed.")
+      } catch (error) {
+        return desktopToolError(error)
       }
-      if (input.button === "right") args.push("--right")
-      if (input.button === "middle") args.push("--middle")
-      if (input.click_count === 2) args.push("--double")
-      if (input.click_count === 3) args.push("--triple")
-      if (input.long_press) args.push("--long-press")
-      if (input.foreground || forceForeground) {
-        args.push("--foreground")
+    }
+  )
+
+  registerAction(
+    "computer_hover",
+    {
+      description:
+        "Move the pointer over an element, visible text, or coordinates from a snapshot without clicking, to reveal a tooltip or a hover menu. The pointer stays there.",
+      inputSchema: z.object({ ...observeAfterField, ...pointFields }).superRefine(checkPointTarget),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (input, ctx) => {
+      try {
+        const target = pointArgs(desktop, input)
+        const args = ["click", ...target.args, "--hover"]
+        if (input.wait_ms !== undefined) args.push("--wait-for", String(input.wait_ms))
+        return await runPointCommand(desktop, args, target, ctx.mcpReq.signal, "Pointer moved.")
+      } catch (error) {
+        return desktopToolError(error)
       }
-      if (input.wait_ms !== undefined) args.push("--wait-for", String(input.wait_ms))
-      if (localExactWindowTarget) {
-        try {
-          const result = await desktop.runWithFreshLocalWindowSnapshot(
-            localExactWindowTarget,
-            args,
-            ctx.mcpReq.signal
-          )
-          return commandResult(result, "Click completed.")
-        } catch (error) {
-          return desktopToolError(error)
-        }
-      }
-      return callDesktop(desktop, args, ctx.mcpReq.signal, "Click completed.")
     }
   )
 
@@ -650,7 +686,7 @@ export function registerComputerUseTools(
     }
   )
 
-  registerGnomeTools(registerTool, desktop)
+  registerGnomeTools(register, desktop)
 
   const appSchema = z
     .object({
@@ -793,6 +829,8 @@ export function registerComputerUseTools(
       return callDesktop(desktop, args, ctx.mcpReq.signal, `Window ${input.action} completed.`)
     }
   )
+
+  registerBatchTool(registerTool, tools)
 }
 
 function hasScrollBackgroundTarget(

@@ -12,6 +12,7 @@ pointer and keyboard.
 """
 
 import gettext
+import hashlib
 import json
 import os
 import secrets
@@ -41,6 +42,18 @@ SUPPORTED_API = 4  # the oldest extension this helper can drive
 CURSOR_API = 5  # first extension that draws the agent cursor
 HALT_API = 6  # first extension with the user's emergency stop (Super+Ctrl+Esc)
 ANNOUNCE_API = 7  # first extension that keeps the cursor's label up while an action runs, and can close the overview
+ACCESS_API = 8  # first extension that asks the user which apps Claude may use
+ACCESS_PROMPT_TIMEOUT_MS = 150_000  # the extension gives up on its dialog before this
+TIERS = {"read": 1, "click": 2, "full": 3}
+TIER_HELP = "read: observe only. click: observe, left-click and scroll. full: everything."
+# The least access each command needs on the window it targets. The extension enforces the same
+# on raw input, so input with no named target (foreground typing, global clicks) is covered there.
+COMMAND_ACCESS = {
+    "see": "read", "watch": "read", "frames": "read", "window": "read", "click": "click", "scroll": "click",
+    "type": "full", "press": "full", "drag": "full", "move": "full", "hold": "full",
+}
+SHELL_ACCESS_KEY = "shell"
+SHELL_NAMES = {"shell", "gnome shell", "gnome-shell", "desktop"}
 OVERVIEW_CLOSE_S = 0.45  # the shell animates the overview away before windows take input again
 # Commands that act on the desktop; reading (see, screen) keeps working while paused.
 ACTING_COMMANDS = {"click", "type", "press", "scroll", "drag", "move", "hold", "clipboard", "app", "window"}
@@ -56,6 +69,13 @@ OCR_TIMEOUT_S = 15
 TREE_ELEMENT_TIME_BUDGET_S = 12.0
 DELIVERY_CONFIRM_BUDGET_S = 1.5
 MINIMIZED_RESTORE_WAIT_S = 0.4
+# Two frames differ when more pixels than a blinking text caret covers changed visibly.
+WATCH_TOLERANCE = 12
+WATCH_MIN_PIXELS = 48
+WATCH_SPAN = 32  # pixels compared at once; only spans that differ are read pixel by pixel
+WATCH_POLL_S = 0.15
+WATCH_STILL_S = 1.0  # how long the picture must hold before it counts as settled
+FRAME_MAX_EDGE = 768  # frames are for watching motion, not for reading or aiming
 SHELL_WINDOW_ID = 0
 SHELL_WINDOW_ACTOR_LABELS = ("Wayland ", "X11 ")
 APP_LAUNCH_TIMEOUT_S = 25
@@ -73,6 +93,7 @@ VALUED_OPTIONS = {
     "--screen-index", "--depth", "--max-elements", "--max-children", "--on", "--at",
     "--wait-for", "--text", "--delay", "--count", "--direction", "--amount", "--from",
     "--to", "--duration", "--steps", "--dx", "--dy", "--keys", "--button", "--action", "--screen", "--workspace", "--skip", "--x", "--y", "--width", "--height",
+    "--modifiers", "--reason", "--region", "--until", "--timeout", "--interval", "--max-bytes",
 }
 REPEATED_OPTIONS = {"--open"}
 
@@ -106,6 +127,14 @@ INTERACTIVE_ROLES = {
 }
 EDITABLE_ROLES = {Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT, Atspi.Role.TEXT}
 FRAME_ROLES = {Atspi.Role.FRAME, Atspi.Role.WINDOW, Atspi.Role.DIALOG, Atspi.Role.ALERT}
+
+
+# Problems the running command worked around. They do not fail it, but the server keeps them in its error log.
+WARNINGS = []
+
+
+def warn(code, message):
+    WARNINGS.append({"code": code, "message": message})
 
 
 class Fail(Exception):
@@ -184,6 +213,8 @@ class Desktop:
         api = info.get("api")
         self.api = api if isinstance(api, int) else 0
         self.halted = self.api >= HALT_API and bool(info.get("halted"))
+        self.asking = bool(info.get("asking"))
+        self.need = None  # the access the running command needs on its target; see COMMAND_ACCESS
         if self.api < SUPPORTED_API:
             raise Fail(
                 "DESKTOP_EXTENSION_OUTDATED",
@@ -191,9 +222,9 @@ class Desktop:
                 "Run /computer-claude:setup in Claude Code, then log out and back in.",
             )
 
-    def call(self, method, parameters=None):
+    def call(self, method, parameters=None, timeout_ms=20_000):
         try:
-            result = self.proxy.call_sync(method, parameters, Gio.DBusCallFlags.NONE, 20_000, None)
+            result = self.proxy.call_sync(method, parameters, Gio.DBusCallFlags.NONE, timeout_ms, None)
         except GLib.Error as error:
             # strip_remote_error edits the C struct but not the Python copy of the message.
             message = error.message
@@ -210,6 +241,10 @@ class Desktop:
 
     def monitors(self):
         return json.loads(self.call("ListMonitors"))
+
+    def grants(self):
+        """Apps the user granted, as {key: {"name", "tier"}}; None when the extension has no access control."""
+        return json.loads(self.call("Access")) if self.api >= ACCESS_API else None
 
     def window_action(self, window_id, action, geometry=()):
         self.call("WindowAction", GLib.Variant("(tsai)", (window_id, action, list(geometry))))
@@ -364,7 +399,33 @@ def window_view(window):
         "is_maximized": window["maximized"],
         "screen_index": window["monitor"],
         "workspace": window["workspace"],
+        **({"access": window["access"] or "not granted"} if "access" in window else {}),
     }
+
+
+def app_label(window):
+    return window["app"] or window["wm_class"] or "This app"
+
+
+def require_access(desktop, window):
+    """Fail unless the user granted this window's app what the running command needs."""
+    access = window.get("access")
+    # An extension older than ACCESS_API reports no access and enforces none.
+    if desktop.need is None or access is None:
+        return window
+    name = app_label(window)
+    if not access:
+        raise Fail(
+            "APP_NOT_GRANTED",
+            f"{name} has not been granted to Claude. Call computer_access with action=request and apps=[{json.dumps(name)}], then retry.",
+        )
+    if TIERS[access] < TIERS[desktop.need]:
+        raise Fail(
+            "ACCESS_TIER",
+            f"{name} is granted {access!r} access and this needs {desktop.need!r} ({TIER_HELP}) "
+            "Do not look for another way in; tell the user what you could not do.",
+        )
+    return window
 
 
 def bounds_of(item):
@@ -399,6 +460,11 @@ def app_windows(windows, app):
 
 
 def resolve_window(desktop, options, snapshot=None, required=True):
+    window = find_window(desktop, options, snapshot, required)
+    return require_access(desktop, window) if window is not None else None
+
+
+def find_window(desktop, options, snapshot, required):
     windows = desktop.windows()
     if "--window-id" in options:
         window_id = integer(options, "--window-id")
@@ -483,6 +549,14 @@ def accessibility_available():
     return True
 
 
+def accessibility_root():
+    accessibility_root.used = True
+    return Atspi.get_desktop(0)
+
+
+accessibility_root.used = False
+
+
 def application_frames(application):
     frames = []
     for index in range(application.get_child_count()):
@@ -494,7 +568,7 @@ def application_frames(application):
 
 def accessible_frame(window):
     """Find the AT-SPI top-level accessible that corresponds to a compositor window."""
-    desktop = Atspi.get_desktop(0)
+    desktop = accessibility_root()
     own, others = [], []
     for index in range(desktop.get_child_count()):
         try:
@@ -720,6 +794,10 @@ def collect_screen_elements(desktop, screen_index, max_depth, max_elements, max_
             elements.extend(element for element, _ in kept)
             lines.extend(line for _, line in kept)
     for window in windows:
+        if window.get("access") == "":
+            # Not granted: its elements stay unread, and it still hides what is behind it.
+            covering.append(window)
+            continue
         found, found_lines, cut = collect_elements(
             window, max_depth, max_elements - len(elements), max_children, deadline, next_id
         )
@@ -748,7 +826,7 @@ def shell_window():
     """A stand-in window for GNOME Shell's own interface, whose coordinates are already global."""
     if not accessibility_available():
         return None
-    root = Atspi.get_desktop(0)
+    root = accessibility_root()
     for index in range(root.get_child_count()):
         application = root.get_child_at_index(index)
         if application is not None and application.get_name() == "gnome-shell":
@@ -819,11 +897,15 @@ def element_window(desktop, snapshot, element):
     if "window_id" not in element:
         return resolve_window(desktop, {}, snapshot)
     if element["window_id"] == SHELL_WINDOW_ID:
-        return shell_window()
+        window = shell_window()
+        grants = desktop.grants()
+        if window is not None and grants is not None:
+            window["access"] = grants.get(SHELL_ACCESS_KEY, {}).get("tier", "")
+        return require_access(desktop, window) if window is not None else None
     window = next((item for item in desktop.windows() if item["id"] == element["window_id"]), None)
     if window is None:
         raise Fail("WINDOW_NOT_FOUND", "The observed window is gone. Call computer_observe again.")
-    return window
+    return require_access(desktop, window)
 
 
 def image_origin(window, snapshot):
@@ -1013,8 +1095,23 @@ def to_logical_size(path, bounds):
     pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
     if pixbuf.get_width() == bounds["width"] and pixbuf.get_height() == bounds["height"]:
         return
-    scaled = pixbuf.scale_simple(bounds["width"], bounds["height"], GdkPixbuf.InterpType.BILINEAR)
-    scaled.savev(path, "png", [], [])
+    write_png(pixbuf.scale_simple(bounds["width"], bounds["height"], GdkPixbuf.InterpType.BILINEAR), path)
+
+
+def write_png(pixbuf, path):
+    """Through cairo: GdkPixbuf saves in a sandboxed loader process, which costs over 100 ms an image."""
+    try:
+        import cairo
+    except ImportError:
+        pixbuf.savev(path, "png", [], [])
+        return
+    image_format = cairo.FORMAT_ARGB32 if pixbuf.get_has_alpha() else cairo.FORMAT_RGB24
+    surface = cairo.ImageSurface(image_format, pixbuf.get_width(), pixbuf.get_height())
+    context = cairo.Context(surface)
+    context.set_operator(cairo.OPERATOR_SOURCE)
+    Gdk.cairo_set_source_pixbuf(context, pixbuf, 0, 0)
+    context.paint()
+    surface.write_to_png(path)
 
 
 def parse_ocr(tsv):
@@ -1048,14 +1145,29 @@ def read_text(path):
     """OCR an image; an empty result when Tesseract is missing or fails."""
     if shutil.which("tesseract") is None:
         return []
+    # Reading a window takes about a second, and a window that did not change reads the same.
+    with open(path, "rb") as file:
+        digest = hashlib.sha1(file.read()).digest()
+    if digest in read_text.cache:
+        return read_text.cache[digest]
     try:
         result = subprocess.run(
             ["tesseract", path, "stdout", "-l", "por+eng", "--psm", "11", "tsv"],
             capture_output=True, text=True, timeout=OCR_TIMEOUT_S, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as error:
+        warn("OCR_FAILED", f"Tesseract did not read the window: {type(error).__name__}.")
         return []
-    return parse_ocr(result.stdout) if result.returncode == 0 else []
+    if result.returncode != 0:
+        warn("OCR_FAILED", f"Tesseract exited with code {result.returncode}: {result.stderr.strip()[-300:]}")
+        return []
+    if len(read_text.cache) >= 8:
+        del read_text.cache[next(iter(read_text.cache))]
+    read_text.cache[digest] = parse_ocr(result.stdout)
+    return read_text.cache[digest]
+
+
+read_text.cache = {}
 
 
 def ocr_elements(window, path, offset, first_id):
@@ -1140,6 +1252,7 @@ def command_see(desktop, positional, options):
         if monitor is None:
             raise Fail("SCREEN_NOT_FOUND", f"No screen has index {screen_index}.")
         bounds = bounds_of(monitor)
+        windows = desktop.windows()
         if capture:
             desktop.screenshot("screen+cursor" if options.get("--with-cursor") else "screen", screen_index, path)
             to_logical_size(path, bounds)
@@ -1152,7 +1265,7 @@ def command_see(desktop, positional, options):
                 integer(options, "--max-elements", OBSERVE_MAX_ELEMENTS),
                 integer(options, "--max-children", OBSERVE_MAX_CHILDREN),
             )
-        origins = {item["id"]: item for item in desktop.windows()}
+        origins = {item["id"]: item for item in windows}
         for element in elements:
             window = origins.get(element["window_id"], bounds)
             element["image_x"] = window["x"] - bounds["x"] + element["x"]
@@ -1176,6 +1289,17 @@ def command_see(desktop, positional, options):
                 data["screenshot_annotated"] = annotated
         if tree or lines:
             data["text"] = "\n".join(lines) or "No accessible elements were exposed on this screen."
+        # The extension paints those windows black; this names them, so the model knows what it is not seeing.
+        names = sorted({
+            app_label(item) for item in windows
+            if item.get("access") == "" and item["monitor"] == screen_index
+            and item["on_active_workspace"] and not item["minimized"]
+        })
+        if names:
+            data["text"] = (
+                f"Note: apps the user has not granted are blacked out and their elements left out: {', '.join(names)}. "
+                "Request them with computer_access if the task needs them.\n" + data.get("text", "")
+            ).rstrip()
         return data, f"Observed screen {screen_index}."
 
     window = resolve_window(desktop, options)
@@ -1214,7 +1338,8 @@ def observe_window(desktop, window, options, snapshot_id, tree, capture, path):
         )
 
     offset = (bounds["x"] - window["x"], bounds["y"] - window["y"])
-    if not options.get("--no-elements") and not any(element["interactive"] for element in elements):
+    unread = not options.get("--no-elements") and not any(element["interactive"] for element in elements)
+    if unread and not options.get("--no-ocr"):
         image = path if capture else os.path.join(snapshot_directory(), f"ocr-{snapshot_id}.png")
         try:
             if not capture:
@@ -1259,6 +1384,11 @@ def observe_window(desktop, window, options, snapshot_id, tree, capture, path):
             data["screenshot_annotated"] = annotated
     if truncated:
         data["truncated"] = True
+    if unread and options.get("--no-ocr"):
+        lines.append(
+            "This window exposes no elements and its text was not read. Click by query or by coordinates, "
+            "or call computer_observe for the text."
+        )
     if tree or lines:
         data["text"] = "\n".join(lines) or (
             "No accessible elements were exposed by this window. Use coordinates from computer_observe instead."
@@ -1280,6 +1410,10 @@ def command_click(desktop, positional, options):
     button = BUTTONS["right"] if options.get("--right") else BUTTONS["middle"] if options.get("--middle") else BUTTONS["left"]
     count = 3 if options.get("--triple") else 2 if options.get("--double") else 1
     hold = 0.8 if options.get("--long-press") else 0.0
+    modifiers = keysyms_for_token(options["--modifiers"]) if "--modifiers" in options else []
+    hover = bool(options.get("--hover"))
+    if not hover and (button != BUTTONS["left"] or hold or modifiers):
+        desktop.need = "full"
 
     if "--at" in options:
         desktop.ensure_input_available()
@@ -1302,7 +1436,7 @@ def command_click(desktop, positional, options):
         if element.get("window_id") != SHELL_WINDOW_ID:
             desktop.ensure_input_available()
         target = f"{element['role']} {element['label']!r}".strip()
-        plain_click = button == BUTTONS["left"] and count == 1 and not hold
+        plain_click = not hover and button == BUTTONS["left"] and count == 1 and not hold and not modifiers
         if plain_click and not options.get("--foreground"):
             window = element_window(desktop, snapshot, element)
             name = short(element["label"]) if element.get("label") else ""
@@ -1313,7 +1447,20 @@ def command_click(desktop, positional, options):
                 return {"clicked": target, "via": "accessibility"}, f"Focused {target}."
         x, y = element_point(desktop, snapshot, element)
 
-    desktop.click(x, y, button, count, hold)
+    if hover:
+        desktop.pointer_move(x, y)
+        return {"hovered": target, "x": round(x), "y": round(y)}, f"The pointer is over {target}."
+    try:
+        # Held through the extension, so a pause or a lost caller releases them.
+        for keyval in modifiers:
+            desktop.hold("key", keyval, True)
+        desktop.click(x, y, button, count, hold)
+    finally:
+        for keyval in reversed(modifiers):
+            try:
+                desktop.hold("key", keyval, False)
+            except Fail:
+                pass  # refused only while paused, and pausing has already released every held key
     return {"clicked": target, "x": round(x), "y": round(y)}, f"Clicked {target}."
 
 
@@ -1722,7 +1869,7 @@ def background_applications(known_pids):
     """Applications registered with AT-SPI that have no window."""
     if not accessibility_available():
         return []
-    root = Atspi.get_desktop(0)
+    root = accessibility_root()
     found = {}
     for index in range(root.get_child_count()):
         try:
@@ -1748,7 +1895,8 @@ def command_app(desktop, positional, options):
             entry = applications.setdefault(
                 key,
                 {"name": window["app"] or window["wm_class"], "desktop_id": window["app_id"], "pid": window["pid"],
-                 "window_count": 0, "is_active": False, "is_hidden": True},
+                 "window_count": 0, "is_active": False, "is_hidden": True,
+                 **({"access": window["access"] or "not granted"} if "access" in window else {})},
             )
             entry["window_count"] += 1
             entry["is_active"] = entry["is_active"] or window["focused"]
@@ -1760,6 +1908,7 @@ def command_app(desktop, positional, options):
             f"{entry['name']} (PID:{entry['pid']}, {entry['window_count']} window(s))"
             f"{' [active]' if entry['is_active'] else ''}{' [hidden]' if entry['is_hidden'] else ''}"
             f"{' [background]' if entry.get('is_background') else ''}"
+            f"{' [access: ' + entry['access'] + ']' if entry.get('access') else ''}"
             for entry in listed
         ]
         return {"applications": listed}, "\n".join(lines) or "No applications have open windows."
@@ -1781,6 +1930,11 @@ def command_app(desktop, positional, options):
         desktop.focus(candidates[0])
         return {"window": window_view(candidates[0])}, f"Switched to {candidates[0]['app']}."
     if action == "quit":
+        if options.get("--force"):
+            # Killing a process never reaches the extension, which checks every other way to close an app.
+            desktop.need = "full"
+            for window in app_windows(windows, options.get("--app", "")):
+                require_access(desktop, window)
         closed, gone = quit_application(desktop, options.get("--app", ""), bool(options.get("--force")))
         summary = f"Quit {closed[0]['app']}." if gone else f"Asked {closed[0]['app']} to close; some windows are still open (unsaved changes?)."
         return {"app": closed[0]["app"], "quit": gone}, summary
@@ -1861,6 +2015,62 @@ def command_screen(desktop, positional, options):
     return {"screens": screens, "primaryIndex": primary}, "\n".join(lines)
 
 
+def command_pointer(desktop, positional, options):
+    x, y = desktop.pointer_position()
+    over = next(
+        (
+            item for item in sorted(desktop.windows(), key=lambda item: -item["stacking"])
+            if not item["minimized"] and item["on_active_workspace"] and contains(item, x, y)
+        ),
+        None,
+    )
+    data = {"x": round(x), "y": round(y)}
+    summary = f"The pointer is at desktop ({round(x)}, {round(y)})"
+    if over is not None:
+        data["window"] = window_view(over)
+        summary += f", over {app_label(over)} — {over['title']} (window_id={over['id']})"
+    return data, summary + "."
+
+
+def access_key(desktop, name):
+    """The extension's key for an app named the way the other tools name it."""
+    if name.casefold() in SHELL_NAMES:
+        return SHELL_ACCESS_KEY
+    running = app_windows(desktop.windows(), name)
+    return running[0]["access_key"] if running else find_application(name).get_id() or ""
+
+
+def command_access(desktop, positional, options):
+    action = positional[0] if positional else "list"
+    if desktop.api < ACCESS_API:
+        raise Fail(
+            "DESKTOP_EXTENSION_OUTDATED",
+            "Per-app access needs a newer Computer Claude extension; until then every app is reachable. "
+            "Run /computer-claude:setup in Claude Code, then log out and back in.",
+        )
+    if action == "list":
+        grants = desktop.grants()
+        lines = [f"{grant['name']}: {grant['tier']}" for grant in grants.values()]
+        return {"grants": grants}, "\n".join(lines) or "No app is granted yet. Use action=request with the apps the task needs."
+    if action == "revoke":
+        desktop.call("RevokeAccess")
+        return {"grants": {}}, "All access was revoked."
+    if action != "request" or len(positional) < 2:
+        raise Fail("INVALID_ARGUMENTS", "Use access list, access revoke, or access request <app>...")
+    keys = [access_key(desktop, name) for name in positional[1:]]
+    reason = options.get("--reason") if isinstance(options.get("--reason"), str) else ""
+    result = json.loads(
+        desktop.call("RequestAccess", GLib.Variant("(ass)", (keys, reason)), ACCESS_PROMPT_TIMEOUT_MS)
+    )
+    lines = [f"{name}: {tier}" for name, tier in result["granted"].items()]
+    lines += [f"{name}: denied by the user" for name in result["denied"]]
+    if result["granted"]:
+        lines.append(TIER_HELP)
+    if result["denied"]:
+        lines.append("Do not ask again for a denied app unless the user tells you to.")
+    return result, "\n".join(lines)
+
+
 def command_permissions():
     status = {"session_type": os.environ.get("XDG_SESSION_TYPE", "unknown")}
     try:
@@ -1869,19 +2079,67 @@ def command_permissions():
     except Fail as failure:
         status["desktop_extension"] = failure.code
     status["accessibility"] = "ready" if accessibility_available() else "unavailable"
+    if status["desktop_extension"] == "ready":
+        status["app_access"] = "enforced" if Desktop().api >= ACCESS_API else "off (extension outdated: log out and back in)"
     lines = [f"{name}: {value}" for name, value in status.items()]
     if status["desktop_extension"] != "ready":
         lines.append("Run /computer-claude:setup in Claude Code, then log out and back in.")
     return status, "\n".join(lines)
 
 
+# A larger PNG is a photo or a game, which a JPEG carries in a fraction of the bytes; the image is sent again every turn.
+PNG_MAX_BYTES = 500_000
 JPEG_QUALITIES = (85, 65, 55, 45, 35)
 
 
-def command_jpeg(positional):
-    """Re-encode a capture as a JPEG that fits the byte budget, optionally cropped and downscaled.
+def crop_pixbuf(pixbuf, region):
+    x = min(max(region[0], 0), pixbuf.get_width() - 1)
+    y = min(max(region[1], 0), pixbuf.get_height() - 1)
+    width = min(region[2], pixbuf.get_width() - x)
+    height = min(region[3], pixbuf.get_height() - y)
+    if width <= 0 or height <= 0:
+        raise Fail("INVALID_ARGUMENTS", "The region is empty.")
+    return pixbuf.new_subpixbuf(x, y, width, height)
 
-    Usage: jpeg <source> <destination> <max-bytes> [max-edge] [x,y,width,height]
+
+def save_image(pixbuf, destination, budget, max_edge=0, source=None):
+    """Write the image within the byte budget, downscaled to max_edge; `destination` has no extension.
+
+    A PNG when it fits: captures are PNGs already and writing one is fast. A JPEG otherwise, for photos and games.
+    `source` is the file the pixbuf was loaded from, used as it is when nothing about it has to change.
+    """
+    width, height = pixbuf.get_width(), pixbuf.get_height()
+    scale = 1.0
+    if max_edge and max(width, height) > max_edge:
+        scale = max_edge / max(width, height)
+        pixbuf = pixbuf.scale_simple(
+            max(round(width * scale), 1), max(round(height * scale), 1), GdkPixbuf.InterpType.HYPER
+        )
+        source = None
+    data = {"width": pixbuf.get_width(), "height": pixbuf.get_height(), "scale": scale}
+    path = source
+    if path is None:
+        path = destination + ".png"
+        write_png(pixbuf, path)
+    if os.path.getsize(path) <= min(budget, PNG_MAX_BYTES):
+        return {**data, "path": path, "mime": "image/png"}
+    if pixbuf.get_has_alpha():
+        opaque = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, data["width"], data["height"])
+        opaque.fill(0xFFFFFFFF)
+        pixbuf.composite(opaque, 0, 0, data["width"], data["height"], 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
+        pixbuf = opaque
+    path = destination + ".jpg"
+    for quality in JPEG_QUALITIES:
+        pixbuf.savev(path, "jpeg", ["quality"], [str(quality)])
+        if os.path.getsize(path) <= budget:
+            return {**data, "path": path, "mime": "image/jpeg"}
+    raise Fail("IMAGE_TOO_LARGE", f"The screenshot does not fit in {budget} bytes.")
+
+
+def command_encode(positional):
+    """Make a capture fit to send: optionally cropped, downscaled to max-edge, within the byte budget.
+
+    Usage: encode <source> <destination without extension> <max-bytes> [max-edge] [x,y,width,height]
     """
     try:
         source, destination, budget = positional[0], positional[1], int(positional[2])
@@ -1890,34 +2148,129 @@ def command_jpeg(positional):
         if crop is not None and len(crop) != 4:
             raise ValueError
     except (IndexError, ValueError):
-        raise Fail("INVALID_ARGUMENTS", "Usage: jpeg <source> <destination> <max-bytes> [max-edge] [x,y,width,height].") from None
+        raise Fail("INVALID_ARGUMENTS", "Usage: encode <source> <destination> <max-bytes> [max-edge] [x,y,width,height].") from None
     pixbuf = GdkPixbuf.Pixbuf.new_from_file(source)
     if crop is not None:
-        x = min(max(crop[0], 0), pixbuf.get_width() - 1)
-        y = min(max(crop[1], 0), pixbuf.get_height() - 1)
-        width = min(crop[2], pixbuf.get_width() - x)
-        height = min(crop[3], pixbuf.get_height() - y)
-        if width <= 0 or height <= 0:
-            raise Fail("INVALID_ARGUMENTS", "The region is empty.")
-        pixbuf = pixbuf.new_subpixbuf(x, y, width, height)
-    width, height = pixbuf.get_width(), pixbuf.get_height()
-    if pixbuf.get_has_alpha():
-        opaque = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, width, height)
-        opaque.fill(0xFFFFFFFF)
-        pixbuf.composite(opaque, 0, 0, width, height, 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
-        pixbuf = opaque
-    scale = 1.0
-    if max_edge and max(width, height) > max_edge:
-        scale = max_edge / max(width, height)
-        pixbuf = pixbuf.scale_simple(
-            max(round(width * scale), 1), max(round(height * scale), 1), GdkPixbuf.InterpType.HYPER
-        )
-    for quality in JPEG_QUALITIES:
-        pixbuf.savev(destination, "jpeg", ["quality"], [str(quality)])
-        if os.path.getsize(destination) <= budget:
-            data = {"path": destination, "width": pixbuf.get_width(), "height": pixbuf.get_height(), "scale": scale}
-            return data, "Encoded."
-    raise Fail("IMAGE_TOO_LARGE", f"The screenshot does not fit in {budget} bytes.")
+        return save_image(crop_pixbuf(pixbuf, crop), destination, budget, max_edge), "Encoded."
+    return save_image(pixbuf, destination, budget, max_edge, source), "Encoded."
+
+
+# ------------------------------------------------------------------- motion
+
+
+def frame_source(desktop, options):
+    """A function that captures the command's target, cropped to --region, as a pixbuf."""
+    if options.get("--mode") in ("screen", "frontmost"):
+        monitors = desktop.monitors()
+        target = integer(options, "--screen-index", next((item["index"] for item in monitors if item["primary"]), 0))
+        if not any(item["index"] == target for item in monitors):
+            raise Fail("SCREEN_NOT_FOUND", f"No screen has index {target}.")
+        kind = "screen"
+    else:
+        window = resolve_window(desktop, options)
+        if window["minimized"]:
+            raise Fail("WINDOW_MINIMIZED", "A minimized window paints nothing; restore it first.")
+        kind, target = "window", window["id"]
+    region = None
+    if "--region" in options:
+        try:
+            region = [int(float(part)) for part in options["--region"].split(",")]
+            if len(region) != 4:
+                raise ValueError
+        except ValueError:
+            raise Fail("INVALID_ARGUMENTS", "--region must be formatted as x,y,width,height.") from None
+    path = os.path.join(snapshot_directory(), f"frame-{secrets.token_hex(4)}.png")
+
+    def capture():
+        try:
+            bounds = desktop.screenshot(kind, target, path)
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+        # One image pixel per logical desktop pixel, as in an observation, so regions line up.
+        if (pixbuf.get_width(), pixbuf.get_height()) != (bounds["width"], bounds["height"]):
+            pixbuf = pixbuf.scale_simple(bounds["width"], bounds["height"], GdkPixbuf.InterpType.BILINEAR)
+        return crop_pixbuf(pixbuf, region) if region else pixbuf
+
+    return capture
+
+
+def frames_differ(one, other):
+    width, height = one.get_width(), one.get_height()
+    if (width, height) != (other.get_width(), other.get_height()):  # the target was resized
+        return True
+    before, after = one.get_pixels(), other.get_pixels()
+    stride, channels = one.get_rowstride(), one.get_n_channels()
+    enough = min(WATCH_MIN_PIXELS, max(width * height // 100, 1))
+    changed = 0
+    for row in range(height):
+        start, end = row * stride, row * stride + width * channels
+        if before[start:end] == after[start:end]:
+            continue
+        for offset in range(start, end, WATCH_SPAN * channels):
+            stop = min(offset + WATCH_SPAN * channels, end)
+            if before[offset:stop] == after[offset:stop]:
+                continue
+            for pixel in range(offset, stop, channels):
+                if any(abs(before[pixel + c] - after[pixel + c]) > WATCH_TOLERANCE for c in range(3)):
+                    changed += 1
+            if changed >= enough:
+                return True
+    return False
+
+
+def command_watch(desktop, positional, options):
+    """Wait until the target's picture differs from how it started, or until it stops changing."""
+    until = options.get("--until")
+    if until not in ("change", "still"):
+        raise Fail("INVALID_ARGUMENTS", "--until must be change or still.")
+    timeout = integer(options, "--timeout", 10_000) / 1000
+    capture = frame_source(desktop, options)
+    started = time.monotonic()
+    reference = capture()
+    still_since = started
+    while True:
+        time.sleep(WATCH_POLL_S)
+        current = capture()
+        now = time.monotonic()
+        differs = frames_differ(reference, current)
+        elapsed = round((now - started) * 1000)
+        if until == "change":
+            # Against the first frame, so a slow change adds up instead of hiding between two polls.
+            if differs:
+                return {"met": True, "elapsed_ms": elapsed}, f"The picture changed after {elapsed} ms."
+        else:
+            reference = current
+            if differs:
+                still_since = now
+            elif now - still_since >= WATCH_STILL_S:
+                return {"met": True, "elapsed_ms": elapsed}, f"The picture settled after {elapsed} ms."
+        if now - started >= timeout:
+            return {"met": False, "elapsed_ms": elapsed}, "Timed out."
+
+
+def command_frames(desktop, positional, options):
+    """Capture the target several times in a row and write each frame as an image into --path."""
+    directory = options.get("--path")
+    count = integer(options, "--count", 4)
+    budget = integer(options, "--max-bytes")
+    if not directory or budget is None or count < 1:
+        raise Fail("INVALID_ARGUMENTS", "Usage: frames --path <directory> --max-bytes <n> [--count n] [--interval ms].")
+    interval = integer(options, "--interval", 500) / 1000
+    capture = frame_source(desktop, options)
+    started = time.monotonic()
+    captured = []
+    for index in range(count):
+        time.sleep(max(started + index * interval - time.monotonic(), 0))
+        at = round((time.monotonic() - started) * 1000)
+        captured.append((at, capture()))
+    # Encoded afterwards, so that encoding does not stretch the time between frames.
+    frames = []
+    for index, (at, pixbuf) in enumerate(captured):
+        saved = save_image(pixbuf, os.path.join(directory, f"frame-{index}"), budget, FRAME_MAX_EDGE)
+        frames.append({"path": saved["path"], "mime": saved["mime"], "at_ms": at})
+    return {"frames": frames}, f"Captured {count} frames."
 
 
 def short(text, limit=28):
@@ -1936,6 +2289,8 @@ def action_label(command, positional, options):
             return "Checking the screen"
         return f"Checking {short(app)}" if app else "Looking around"
     if command == "click":
+        if options.get("--hover"):
+            return "Hovering"
         return f"Clicking “{short(first)}”" if first else "Clicking"
     if command == "type":
         return "Typing"
@@ -1995,6 +2350,8 @@ def announcing(desktop, command, positional, options):
 
 COMMANDS = {
     "see": command_see,
+    "watch": command_watch,
+    "frames": command_frames,
     "click": command_click,
     "type": command_type,
     "press": command_press,
@@ -2006,17 +2363,21 @@ COMMANDS = {
     "app": command_app,
     "window": command_window,
     "screen": command_screen,
+    "pointer": command_pointer,
+    "access": command_access,
 }
 
 
-def main(argv):
+def run(argv):
+    """Run one command and return its envelope."""
+    WARNINGS.clear()
     try:
         positional, options = parse_args(argv)
         command = positional[0] if positional else ""
         if command == "permissions":
             data, summary = command_permissions()
-        elif command == "jpeg":
-            data, summary = command_jpeg(positional[1:])
+        elif command == "encode":
+            data, summary = command_encode(positional[1:])
         elif command in COMMANDS:
             desktop = Desktop()
             # AT-SPI actions never reach the extension, so the pause is enforced here as well.
@@ -2025,6 +2386,9 @@ def main(argv):
                     "HALTED",
                     "The user paused Claude with Super+Ctrl+Esc. Do not retry; wait until the user resumes.",
                 )
+            if desktop.asking and command in ACTING_COMMANDS:
+                raise Fail("ACCESS_PROMPT_OPEN", "The user is being asked for access; wait for the answer.")
+            desktop.need = COMMAND_ACCESS.get(command)
             with announcing(desktop, command, positional[1:], options):
                 data, summary = COMMANDS[command](desktop, positional[1:], options)
         else:
@@ -2046,6 +2410,41 @@ def main(argv):
                 "details": traceback.format_exc()[-1500:],
             },
         }
+    if WARNINGS:
+        envelope["warnings"] = list(WARNINGS)
+    return envelope
+
+
+def serve():
+    """Answer commands from stdin, one JSON array of arguments per line, with one envelope per line.
+
+    The server keeps this process for as long as it runs: starting Python and loading the GObject
+    libraries costs more than most commands do.
+    """
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            argv = json.loads(line)
+            if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+                raise ValueError
+        except ValueError:
+            envelope = {"success": False, "error": {"code": "INVALID_ARGUMENTS", "message": "Expected a JSON array of strings."}}
+        else:
+            # Nothing here runs a main loop to keep AT-SPI's cache current, so what an earlier command read is stale.
+            # Only once it has been used: libatspi aborts the process when its bus is missing.
+            if accessibility_root.used:
+                Atspi.get_desktop(0).clear_cache()
+            envelope = run(argv)
+        sys.stdout.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["serve"]:
+        return serve()
+    envelope = run(argv)
     sys.stdout.write(json.dumps(envelope, ensure_ascii=False))
     return 0 if envelope["success"] else 1
 

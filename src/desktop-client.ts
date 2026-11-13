@@ -1,15 +1,14 @@
 /** biome-ignore-all lint/suspicious/noUnnecessaryConditions: Biome fails to track stopping across async lifecycle callbacks */
-import { execFile } from "node:child_process"
 import { copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import process from "node:process"
 import { fileURLToPath } from "node:url"
-import { promisify } from "node:util"
+import { recordError, recordTiming } from "./error-log.js"
+import { HelperProcess } from "./helper-process.js"
 import { asRecord, finiteNumber as numberValue } from "./utils.js"
 
-const execFileAsync = promisify(execFile)
-/** Raw JPEG budget that keeps the base64 image within a 4 MB tool result. */
+/** Raw image budget that keeps the base64 image within a 4 MB tool result. */
 const MAX_IMAGE_BYTES = 2_900_000
 /** Longest screenshot edge. Larger images are downscaled by the model API, which would skew coordinates. */
 const MAX_IMAGE_EDGE = 1568
@@ -20,6 +19,7 @@ interface DesktopEnvelope {
   data?: unknown
   summary?: unknown
   messages?: unknown
+  warnings?: unknown
   error?: {
     code?: unknown
     message?: unknown
@@ -33,9 +33,11 @@ export interface DesktopResult {
   messages?: string[]
 }
 
+export type DesktopImageType = "image/png" | "image/jpeg"
+
 export interface DesktopObservation extends DesktopResult {
   imageData: string
-  mimeType: "image/jpeg"
+  mimeType: DesktopImageType
   target?: DesktopSnapshotTarget
 }
 
@@ -68,10 +70,25 @@ export type DesktopObservationTarget =
   | { kind: "app"; app: string }
   | { kind: "window"; windowId: number; app?: string }
 
+/** What a visual command watches: a target, or one region of a snapshot's screenshot of it. */
+export interface DesktopView {
+  target: DesktopObservationTarget
+  snapshotId?: string
+  region?: DesktopImageRegion
+}
+
+export interface DesktopFrame {
+  imageData: string
+  mimeType: DesktopImageType
+  atMs: number
+}
+
 export interface DesktopObservationRequest {
   target: DesktopObservationTarget
   annotate: boolean
   noWebFocus?: boolean
+  /** Skip reading the text of a window that exposes no elements, which takes about a second. */
+  noOcr?: boolean
   savePath?: string
 }
 
@@ -101,7 +118,6 @@ export interface DesktopClientOptions {
   baseArgs?: string[]
   env?: NodeJS.ProcessEnv
   timeoutMs?: number
-  maxOutputBytes?: number
 }
 
 export class DesktopError extends Error {
@@ -121,10 +137,8 @@ export class DesktopError extends Error {
 export class DesktopClient {
   readonly executable: string
 
-  private readonly baseArgs: string[]
-  private readonly env: NodeJS.ProcessEnv
+  private readonly helper: HelperProcess
   private readonly timeoutMs: number
-  private readonly maxOutputBytes: number
   private readonly shutdownController = new AbortController()
   private readonly snapshots = new Map<string, DesktopSnapshotTarget>()
 
@@ -133,14 +147,17 @@ export class DesktopClient {
 
   constructor(options: DesktopClientOptions = {}) {
     this.executable = options.executable ?? defaultExecutable()
-    this.baseArgs = options.baseArgs ?? []
-    this.env = options.env ?? sessionEnvironment()
+    this.helper = new HelperProcess(
+      this.executable,
+      options.baseArgs ?? [],
+      options.env ?? sessionEnvironment()
+    )
     this.timeoutMs = options.timeoutMs ?? 30_000
-    this.maxOutputBytes = options.maxOutputBytes ?? 4 * 1024 * 1024
   }
 
-  run(args: string[], signal?: AbortSignal): Promise<DesktopResult> {
-    return this.enqueue((requestSignal) => this.runNow(args, requestSignal), signal)
+  /** `timeoutMs` replaces the default for a command that waits on the user. */
+  run(args: string[], signal?: AbortSignal, timeoutMs?: number): Promise<DesktopResult> {
+    return this.enqueue((requestSignal) => this.runNow(args, requestSignal, timeoutMs), signal)
   }
 
   observe(request: DesktopObservationRequest, signal?: AbortSignal): Promise<DesktopObservation> {
@@ -246,6 +263,17 @@ export class DesktopClient {
     return { x: Math.round(x / scale), y: Math.round(y / scale) }
   }
 
+  /** Convert a desktop point into the pixels of a snapshot's screenshot, when its bounds are known. */
+  toImagePixels(snapshotId: string, x: number, y: number): { x: number; y: number } | undefined {
+    const target = this.snapshots.get(snapshotId)
+    if (!target?.bounds) return undefined
+    const scale = target.imageScale ?? 1
+    return {
+      x: Math.round((x - target.bounds.x) * scale),
+      y: Math.round((y - target.bounds.y) * scale),
+    }
+  }
+
   rememberSnapshotTarget(snapshotId: string, target: DesktopSnapshotTarget): void {
     this.rememberSnapshot(snapshotId, target)
   }
@@ -255,6 +283,7 @@ export class DesktopClient {
     this.closed = true
     this.shutdownController.abort()
     await this.queue
+    this.helper.stop()
   }
 
   private enqueue<T>(
@@ -304,13 +333,13 @@ export class DesktopClient {
           await mkdir(dirname(request.savePath), { recursive: true })
           await copyFile(imagePath, request.savePath)
         }
-        const { imageData, scale } = await this.encodeImage(imagePath, directory, signal)
+        const { imageData, mimeType, scale } = await this.encodeImage(imagePath, directory, signal)
         if (snapshotId && target)
           this.rememberSnapshot(snapshotId, { ...target, imageScale: scale })
         return {
           ...result,
           imageData,
-          mimeType: "image/jpeg",
+          mimeType,
           ...(target ? { target } : {}),
         }
       } catch (error) {
@@ -358,7 +387,7 @@ export class DesktopClient {
     snapshotId: string,
     region: DesktopImageRegion,
     signal?: AbortSignal
-  ): Promise<{ imageData: string; mimeType: "image/jpeg" }> {
+  ): Promise<{ imageData: string; mimeType: DesktopImageType }> {
     return this.enqueue(async (requestSignal) => {
       const target = this.requireSnapshotTarget(snapshotId)
       const scale = target.imageScale ?? 1
@@ -372,12 +401,96 @@ export class DesktopClient {
         const crop = [region.x, region.y, region.width, region.height]
           .map((value) => Math.round(value / scale))
           .join(",")
-        const { imageData } = await this.encodeImage(capturePath, directory, requestSignal, crop)
-        return { imageData, mimeType: "image/jpeg" as const }
+        const { imageData, mimeType } = await this.encodeImage(
+          capturePath,
+          directory,
+          requestSignal,
+          crop
+        )
+        return { imageData, mimeType }
       } finally {
         await rm(directory, { recursive: true, force: true })
       }
     }, signal)
+  }
+
+  /** Wait until a view's picture changes, or until it stops changing. */
+  async watch(
+    view: DesktopView,
+    until: "change" | "still",
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<{ met: boolean; elapsedMs: number }> {
+    const result = await this.run(
+      ["watch", ...this.viewArgs(view), "--until", until, "--timeout", String(timeoutMs)],
+      signal,
+      timeoutMs + this.timeoutMs
+    )
+    const data = asRecord(result.data)
+    return { met: data?.met === true, elapsedMs: numberValue(data?.elapsed_ms) ?? 0 }
+  }
+
+  /** Capture a view several times in a row, as small images that show motion. */
+  frames(
+    view: DesktopView,
+    count: number,
+    intervalMs: number,
+    signal?: AbortSignal
+  ): Promise<DesktopFrame[]> {
+    return this.enqueue(async (requestSignal) => {
+      const directory = await mkdtemp(join(tmpdir(), "computer-claude-"))
+      try {
+        const result = await this.runNow(
+          [
+            "frames",
+            ...this.viewArgs(view),
+            "--count",
+            String(count),
+            "--interval",
+            String(intervalMs),
+            "--path",
+            directory,
+            "--max-bytes",
+            String(Math.floor(MAX_IMAGE_BYTES / count)),
+          ],
+          requestSignal,
+          count * intervalMs + this.timeoutMs
+        )
+        const frames = asRecord(result.data)?.frames
+        return await Promise.all(
+          (Array.isArray(frames) ? frames : []).map(async (item) => {
+            const frame = asRecord(item)
+            return {
+              imageData: (await readFile(stringValue(frame?.path) ?? "")).toString("base64"),
+              mimeType: imageType(frame?.mime),
+              atMs: numberValue(frame?.at_ms) ?? 0,
+            }
+          })
+        )
+      } finally {
+        await rm(directory, { recursive: true, force: true })
+      }
+    }, signal)
+  }
+
+  private viewArgs(view: DesktopView): string[] {
+    const args = observationRequestArgs({ target: view.target, annotate: false })
+    if (view.region) {
+      if (!view.snapshotId) {
+        throw new DesktopError(
+          "SNAPSHOT_REQUIRED",
+          "A region needs the snapshot_id it was read from."
+        )
+      }
+      // The region is in the pixels of the screenshot the model saw; the helper crops desktop pixels.
+      const scale = this.requireSnapshotTarget(view.snapshotId).imageScale ?? 1
+      const { x, y, width, height } = view.region
+      args.push(
+        "--region",
+        [x, y, width, height].map((value) => Math.round(value / scale)).join(",")
+      )
+    }
+    return args
   }
 
   private async encodeImage(
@@ -385,22 +498,23 @@ export class DesktopClient {
     directory: string,
     signal: AbortSignal,
     crop?: string
-  ): Promise<{ imageData: string; scale: number }> {
-    const jpegPath = join(directory, "encoded.jpg")
+  ): Promise<{ imageData: string; mimeType: DesktopImageType; scale: number }> {
     const encoded = await this.runNow(
       [
-        "jpeg",
+        "encode",
         imagePath,
-        jpegPath,
+        join(directory, "encoded"),
         String(MAX_IMAGE_BYTES),
         String(MAX_IMAGE_EDGE),
         ...(crop ? [crop] : []),
       ],
       signal
     )
+    const data = asRecord(encoded.data)
     return {
-      imageData: (await readFile(jpegPath)).toString("base64"),
-      scale: numberValue(asRecord(encoded.data)?.scale) ?? 1,
+      imageData: (await readFile(stringValue(data?.path) ?? "")).toString("base64"),
+      mimeType: imageType(data?.mime),
+      scale: numberValue(data?.scale) ?? 1,
     }
   }
 
@@ -481,36 +595,34 @@ export class DesktopClient {
     }
   }
 
-  private async runNow(args: string[], signal: AbortSignal): Promise<DesktopResult> {
+  private async runNow(
+    args: string[],
+    signal: AbortSignal,
+    timeoutMs = this.timeoutMs
+  ): Promise<DesktopResult> {
+    const started = performance.now()
+    let ok = false
     try {
-      return await this.execute(args, signal)
+      const result = await this.execute(args, signal, timeoutMs)
+      ok = true
+      return result
     } catch (error) {
       if (error instanceof DesktopError) error.command ??= args[0]
       throw error
+    } finally {
+      recordTiming({ kind: "helper", name: args[0] ?? "", ms: performance.now() - started, ok })
     }
   }
 
-  private async execute(args: string[], signal: AbortSignal): Promise<DesktopResult> {
-    const commandArgs = [...this.baseArgs, ...args, "--json"]
+  private async execute(
+    args: string[],
+    signal: AbortSignal,
+    timeoutMs: number
+  ): Promise<DesktopResult> {
     let stdout: string
-    let stderr: string
-
     try {
-      const output = await execFileAsync(this.executable, commandArgs, {
-        encoding: "utf8",
-        env: this.env,
-        maxBuffer: this.maxOutputBytes,
-        signal,
-        timeout: this.timeoutMs,
-      })
-      stdout = String(output.stdout)
-      stderr = String(output.stderr)
+      stdout = await this.helper.request(args, signal, timeoutMs)
     } catch (error) {
-      stdout = processOutput(error, "stdout")
-      stderr = processOutput(error, "stderr")
-      const envelope = tryParseEnvelope(stdout)
-      if (envelope?.success === false) throw envelopeError(envelope, error)
-
       if (errorCode(error) === "ENOENT") {
         throw desktopErrorWithCause(
           "HELPER_NOT_FOUND",
@@ -519,17 +631,25 @@ export class DesktopClient {
           error
         )
       }
-
-      const detail = unknownErrorMessage(error)
       throw desktopErrorWithCause(
         "HELPER_PROCESS_FAILED",
-        `The desktop helper command failed: ${detail}`,
-        stderr.trim().slice(-4096) || undefined,
+        `The desktop helper command failed: ${unknownErrorMessage(error)}`,
+        processOutput(error, "stderr").trim() || undefined,
         error
       )
     }
 
-    const envelope = parseEnvelope(stdout, stderr)
+    const envelope = parseEnvelope(stdout)
+    // What the helper worked around does not fail the call, so this is the only record of it.
+    for (const item of Array.isArray(envelope.warnings) ? envelope.warnings : []) {
+      const warning = asRecord(item)
+      recordError({
+        source: "helper",
+        code: stringValue(warning?.code) ?? "HELPER_WARNING",
+        message: stringValue(warning?.message) ?? "",
+        command: args[0],
+      })
+    }
     if (!envelope.success) throw envelopeError(envelope)
 
     return {
@@ -544,14 +664,14 @@ export class DesktopClient {
   }
 }
 
-function parseEnvelope(stdout: string, stderr: string): DesktopEnvelope {
+function parseEnvelope(stdout: string): DesktopEnvelope {
   const envelope = tryParseEnvelope(stdout)
   if (envelope) return envelope
 
   throw new DesktopError(
     "HELPER_INVALID_JSON",
     "The desktop helper did not return its expected JSON response.",
-    stderr.trim().slice(-4096) || stdout.trim().slice(-4096) || undefined
+    stdout.trim().slice(-4096) || undefined
   )
 }
 
@@ -567,6 +687,7 @@ function tryParseEnvelope(stdout: string): DesktopEnvelope | null {
       ...("data" in parsed ? { data: parsed.data } : {}),
       ...("summary" in parsed ? { summary: parsed.summary } : {}),
       ...("messages" in parsed ? { messages: parsed.messages } : {}),
+      ...("warnings" in parsed ? { warnings: parsed.warnings } : {}),
       ...(parsedError
         ? {
             error: {
@@ -582,7 +703,7 @@ function tryParseEnvelope(stdout: string): DesktopEnvelope | null {
   }
 }
 
-function envelopeError(envelope: DesktopEnvelope, cause?: unknown): DesktopError {
+function envelopeError(envelope: DesktopEnvelope): DesktopError {
   const code =
     typeof envelope.error?.code === "string" ? envelope.error.code : "HELPER_COMMAND_FAILED"
   const message =
@@ -590,16 +711,12 @@ function envelopeError(envelope: DesktopEnvelope, cause?: unknown): DesktopError
       ? envelope.error.message
       : "The desktop helper reported a command failure."
   const details = typeof envelope.error?.details === "string" ? envelope.error.details : undefined
-  return cause === undefined
-    ? new DesktopError(code, message, details)
-    : desktopErrorWithCause(code, message, details, cause)
+  return new DesktopError(code, message, details)
 }
 
-function processOutput(error: unknown, field: "stdout" | "stderr"): string {
+function processOutput(error: unknown, field: "stderr"): string {
   const value = asRecord(error)?.[field]
-  if (typeof value === "string") return value
-  if (Buffer.isBuffer(value)) return value.toString("utf8")
-  return ""
+  return typeof value === "string" ? value : ""
 }
 
 function screenshotPath(
@@ -719,6 +836,7 @@ function observationRequestArgs(request: DesktopObservationRequest): string[] {
     args.push("--window-id", String(target.windowId))
   }
   if (request.noWebFocus) args.push("--no-web-focus")
+  if (request.noOcr) args.push("--no-ocr")
   return args
 }
 
@@ -753,6 +871,10 @@ function snapshotObservationTargetArgs(target: DesktopSnapshotTarget): string[] 
   }
   if (target.app) return ["--app", target.app]
   return ["--mode", "frontmost"]
+}
+
+function imageType(value: unknown): DesktopImageType {
+  return value === "image/jpeg" ? "image/jpeg" : "image/png"
 }
 
 function stringValue(value: unknown): string | undefined {

@@ -4,14 +4,22 @@ import type {
   DesktopClient,
   DesktopObservation,
   DesktopObservationTarget,
+  DesktopView,
 } from "./desktop-client.js"
+import { recordError } from "./error-log.js"
 import type { ToolRegistrar } from "./registrar.js"
-import { appInput, desktopToolError, snapshotInput, windowIdInput } from "./tool-shared.js"
+import {
+  appInput,
+  desktopToolError,
+  snapshotInput,
+  toolFailure,
+  windowIdInput,
+} from "./tool-shared.js"
 import { asRecord } from "./utils.js"
 
 /** Time for the UI to react before the observation that follows an action. */
 const SETTLE_MS = 400
-const WAIT_POLL_MS = 500
+const WAIT_POLL_MS = 200
 
 export interface ActionInput {
   observe_after?: boolean
@@ -20,7 +28,41 @@ export interface ActionInput {
   window_id?: number
 }
 
-/** Tools that look at the desktop beyond computer_observe: zooming into a capture and waiting for text. */
+const regionInput = z
+  .object({
+    x: z.number().min(0),
+    y: z.number().min(0),
+    width: z.number().positive(),
+    height: z.number().positive(),
+  })
+  .describe("Part of the snapshot's screenshot to look at, in its pixels. Needs snapshot_id.")
+
+const viewFields = {
+  app: appInput.optional(),
+  window_id: windowIdInput.optional(),
+  snapshot_id: snapshotInput.optional().describe("Look at what this snapshot observed."),
+  region: regionInput.optional(),
+}
+
+interface ViewInput extends ActionInput {
+  region?: DesktopView["region"]
+}
+
+function checkRegion(value: ViewInput, context: z.RefinementCtx): void {
+  if (value.region && !value.snapshot_id) {
+    context.addIssue({ code: "custom", message: "region needs the snapshot_id it was read from." })
+  }
+}
+
+function viewOf(desktop: DesktopClient, input: ViewInput): DesktopView {
+  return {
+    target: targetOf(desktop, input),
+    ...(input.snapshot_id ? { snapshotId: input.snapshot_id } : {}),
+    ...(input.region ? { region: input.region } : {}),
+  }
+}
+
+/** Tools that look at the desktop beyond computer_observe: zooming, waiting, and watching motion. */
 export function registerObservationTools(
   registerTool: ToolRegistrar,
   desktop: DesktopClient
@@ -63,14 +105,25 @@ export function registerObservationTools(
     "computer_wait",
     {
       description:
-        "Wait until text appears in (or, with gone=true, disappears from) the elements of an app, window, or the screen. Use it after launching apps, loading pages, or starting long operations instead of observing repeatedly. Returns a snapshot_id and the matching elements.",
-      inputSchema: z.object({
-        text: z.string().min(1).describe("Label or text to look for, case-insensitive."),
-        app: appInput.optional(),
-        window_id: windowIdInput.optional(),
-        gone: z.boolean().default(false),
-        timeout_ms: z.number().int().min(100).max(60_000).default(10_000),
-      }),
+        'Wait for something that takes time, instead of observing repeatedly. With text: until it appears in (or, with gone=true, disappears from) the elements; returns a snapshot_id and the matching elements. With visual, for apps that expose no elements (games, canvases, Wine): "change" waits until the picture differs from how it looks now, "still" until it stops changing (loading or an animation finished); returns a fresh observation. Narrow a visual wait with snapshot_id and region so a clock or a spinner elsewhere does not end it.',
+      inputSchema: z
+        .object({
+          text: z
+            .string()
+            .min(1)
+            .optional()
+            .describe("Label or text to look for, case-insensitive."),
+          gone: z.boolean().default(false),
+          visual: z.enum(["change", "still"]).optional(),
+          ...viewFields,
+          timeout_ms: z.number().int().min(100).max(60_000).default(10_000),
+        })
+        .superRefine((value, context) => {
+          checkRegion(value, context)
+          if ((value.text === undefined) === (value.visual === undefined)) {
+            context.addIssue({ code: "custom", message: "Supply exactly one of text or visual." })
+          }
+        }),
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -78,13 +131,88 @@ export function registerObservationTools(
         openWorldHint: false,
       },
     },
-    async ({ text, app, window_id, gone, timeout_ms }, ctx) => {
-      return waitForText(
-        desktop,
-        { text, gone, timeoutMs: timeout_ms },
-        observationTarget({ app, window_id }),
-        ctx.mcpReq.signal
-      )
+    async ({ text, gone, visual, timeout_ms, ...input }, ctx) => {
+      const signal = ctx.mcpReq.signal
+      if (text !== undefined) {
+        return waitForText(
+          desktop,
+          { text, gone, timeoutMs: timeout_ms },
+          targetOf(desktop, input),
+          signal
+        )
+      }
+      try {
+        const until = visual ?? "change"
+        const { met, elapsedMs } = await desktop.watch(
+          viewOf(desktop, input),
+          until,
+          timeout_ms,
+          signal
+        )
+        if (!met) {
+          return toolFailure(
+            "WAIT_TIMEOUT",
+            `The picture ${until === "change" ? "did not change" : "kept changing"} within ${timeout_ms} ms. Observe to see the current state.`,
+            "watch"
+          )
+        }
+        const summary = `The picture ${until === "change" ? "changed" : "settled"} after ${elapsedMs} ms.`
+        return await withObservation(
+          desktop,
+          { content: [{ type: "text", text: summary }] },
+          input,
+          signal,
+          0
+        )
+      } catch (error) {
+        return desktopToolError(error)
+      }
+    }
+  )
+
+  registerTool(
+    "computer_frames",
+    {
+      description:
+        "Capture an app, window, the screen, or a region of a snapshot several times in a row, to see motion: an animation, a game, a transition. Frames are small and for watching only; observe again before clicking.",
+      inputSchema: z
+        .object({
+          ...viewFields,
+          count: z.number().int().min(2).max(8).default(4),
+          interval_ms: z.number().int().min(100).max(5000).default(500),
+        })
+        .superRefine(checkRegion),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ count, interval_ms, ...input }, ctx) => {
+      try {
+        const frames = await desktop.frames(
+          viewOf(desktop, input),
+          count,
+          interval_ms,
+          ctx.mcpReq.signal
+        )
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${frames.length} frames, taken at ${frames.map((frame) => frame.atMs).join(", ")} ms.`,
+            },
+            ...frames.map((frame) => ({
+              type: "image" as const,
+              data: frame.imageData,
+              mimeType: frame.mimeType,
+            })),
+          ],
+        }
+      } catch (error) {
+        return desktopToolError(error)
+      }
     }
   )
 }
@@ -125,12 +253,15 @@ async function waitForText(
     }
     await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS))
   } while (elapsed < wait.timeoutMs)
+  const outcome = `${wait.gone ? "was still present" : "did not appear"} within ${wait.timeoutMs} ms.${lastError}`
+  // The log never holds tool arguments, so it leaves out the text that was waited for.
+  recordError({ source: "tool", code: "WAIT_TIMEOUT", command: "see", message: `Text ${outcome}` })
   return {
     isError: true,
     content: [
       {
         type: "text",
-        text: `WAIT_TIMEOUT: ${quoted} ${wait.gone ? "was still present" : "did not appear"} within ${wait.timeoutMs} ms.${lastError} Observe to see the current state.`,
+        text: `WAIT_TIMEOUT: ${quoted} ${outcome} Observe to see the current state.`,
       },
     ],
   }
@@ -146,29 +277,39 @@ export function observationTarget(input: {
   return input.app === undefined ? { kind: "frontmost" } : { kind: "app", app: input.app }
 }
 
+/** What an input names: its app or window, else whatever its snapshot observed. */
+function targetOf(desktop: DesktopClient, input: ActionInput): DesktopObservationTarget {
+  const observed = input.snapshot_id ? desktop.getSnapshotTarget(input.snapshot_id) : undefined
+  if (observed?.kind?.includes("screen")) {
+    return { kind: "screen", screenIndex: observed.screenIndex ?? 0 }
+  }
+  return observationTarget({
+    app: input.app ?? observed?.app,
+    window_id: input.window_id ?? observed?.windowId,
+  })
+}
+
 /** Appends what the target looks like now, so the model need not spend a call to find out. */
 export async function withObservation(
   desktop: DesktopClient,
   result: CallToolResult,
   input: ActionInput,
-  signal: AbortSignal
+  signal: AbortSignal,
+  settleMs = SETTLE_MS
 ): Promise<CallToolResult> {
-  const observed = input.snapshot_id ? desktop.getSnapshotTarget(input.snapshot_id) : undefined
-  let target: DesktopObservationTarget
-  if (observed?.kind?.includes("screen")) {
-    target = { kind: "screen", screenIndex: observed.screenIndex ?? 0 }
-  } else {
-    target = observationTarget({
-      app: input.app ?? observed?.app,
-      window_id: input.window_id ?? observed?.windowId,
-    })
-  }
-  await new Promise((resolve) => setTimeout(resolve, SETTLE_MS))
+  const target = targetOf(desktop, input)
+  await new Promise((resolve) => setTimeout(resolve, settleMs))
   try {
-    const observation = await desktop.observe({ target, annotate: false, noWebFocus: true }, signal)
+    // The picture is what shows the effect; reading a window with no elements would add about a second.
+    const observation = await desktop.observe(
+      { target, annotate: false, noWebFocus: true, noOcr: true },
+      signal
+    )
     return { content: [...result.content, ...observationResult(observation).content] }
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error)
+    // The action itself succeeded, so the call does not fail; the lost observation is still a problem to keep.
+    const failure = desktopToolError(error)
+    const reason = failure.content[0]?.type === "text" ? failure.content[0].text : String(error)
     return {
       content: [
         ...result.content,

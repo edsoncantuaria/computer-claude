@@ -1,7 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/server"
 import { z } from "zod"
 import { type DesktopClient, DesktopError, type DesktopResult } from "./desktop-client.js"
-import { recordError } from "./error-log.js"
+import { recordError, recordTiming } from "./error-log.js"
 
 export const appInput = z.string().min(1).describe("App name, bundle or desktop ID, or PID:12345.")
 export const snapshotInput = z
@@ -29,10 +29,11 @@ export async function callDesktop(
   desktop: DesktopClient,
   args: string[],
   signal: AbortSignal,
-  fallbackSummary: string
+  fallbackSummary: string,
+  timeoutMs?: number
 ): Promise<CallToolResult> {
   try {
-    return commandResult(await desktop.run(args, signal), fallbackSummary)
+    return commandResult(await desktop.run(args, signal, timeoutMs), fallbackSummary)
   } catch (error) {
     return desktopToolError(error)
   }
@@ -45,6 +46,31 @@ export function commandResult(result: DesktopResult, fallbackSummary: string): C
       : (result.messages?.find((message) => message.trim()) ?? fallbackSummary)
   // Text only: a client that prefers structuredContent would hide the summary from the model.
   return { content: [{ type: "text", text: summary }] }
+}
+
+/** Wraps a tool's handler so that every call leaves how long it took in the timing log. */
+export function timed<Input, Context>(
+  name: string,
+  handler: (input: Input, ctx: Context) => Promise<CallToolResult>
+): (input: Input, ctx: Context) => Promise<CallToolResult> {
+  return async (input, ctx) => {
+    const started = performance.now()
+    let ok = false
+    try {
+      const result = await handler(input, ctx)
+      ok = !result.isError
+      return result
+    } finally {
+      recordTiming({ kind: "tool", name, ms: performance.now() - started, ok })
+    }
+  }
+}
+
+/** A failure the tool layer found itself, recorded and worded like one from the helper. */
+export function toolFailure(code: string, message: string, command?: string): CallToolResult {
+  const error = new DesktopError(code, message)
+  error.command = command
+  return desktopToolError(error)
 }
 
 export function desktopToolError(error: unknown): CallToolResult {

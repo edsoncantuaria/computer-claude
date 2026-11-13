@@ -47,12 +47,15 @@ Ask Claude for what you want done on the desktop, for example:
 
 | Tool | What it does |
 | --- | --- |
-| `computer_list` | Apps, windows, screens, or backend status |
+| `computer_list` | Apps (with the access each has), windows, screens, backend status, or where the pointer is |
+| `computer_access` | Ask you to let Claude use apps, list what is granted, or revoke it all |
 | `computer_observe` | Screenshot, snapshot ID, and the element list of an app, window, or screen |
 | `computer_inspect` | More of a snapshot's element tree, paged |
-| `computer_wait` | Wait until text appears in, or disappears from, an app, window, or the screen |
+| `computer_wait` | Wait until text appears in, or disappears from, an app, window, or the screen; or, for apps with no elements (games, canvases, Wine), until the picture changes or stops changing |
+| `computer_frames` | Several small captures in a row, to see motion |
 | `computer_zoom` | A region of an observed screenshot at full resolution, for small text |
-| `computer_click` | Click an element, a text match, or screenshot coordinates |
+| `computer_click` | Click an element, a text match, or screenshot coordinates, optionally with Shift, Ctrl, Alt or Super held |
+| `computer_hover` | Put the pointer over a target without clicking, for tooltips and hover menus |
 | `computer_type` | Type text into a field |
 | `computer_press`, `computer_hotkey` | Key presses and shortcuts |
 | `computer_scroll`, `computer_drag` | Scroll and drag |
@@ -60,10 +63,27 @@ Ask Claude for what you want done on the desktop, for example:
 | `computer_clipboard` | Read and write the clipboard |
 | `computer_app` | Launch, switch to, quit, hide apps |
 | `computer_window`, `computer_window_place` | Focus, move, resize, close windows; send them to another screen or workspace |
+| `computer_batch` | Run several of the tools above in one round trip, stopping at the first failure |
 
-Tools that change the desktop (`computer_click`, `computer_type`, `computer_press`, `computer_hotkey`, `computer_scroll`, `computer_drag`, `computer_app`, `computer_window`) accept `observe_after: true`, which returns the new state in the same call.
+Tools that change the desktop (`computer_click`, `computer_hover`, `computer_type`, `computer_press`, `computer_hotkey`, `computer_scroll`, `computer_drag`, `computer_app`, `computer_window`) accept `observe_after: true`, which returns the new state in the same call.
 
 The plugin also ships a skill, `using-the-desktop`, that teaches Claude how to use these tools: observe a window, act on elements instead of coordinates, confirm the effect, and what to ask you first.
+
+## App access
+
+Claude cannot look at or touch an app until you grant it. When a task needs an app, Claude calls `computer_access` and GNOME Shell shows a dialog that names each app and what Claude would get:
+
+| Tier | Default for | Claude can |
+| --- | --- | --- |
+| read | Web browsers | See the app in screenshots and read its elements |
+| click | Terminals and IDEs | Also left-click and scroll |
+| full | Everything else | Also type, press keys, right-click, drag, and manage its windows |
+
+**Allow** grants each app at its default tier, **Allow full control** grants all of them the full tier, and **Deny** (also Enter, Escape, or two minutes without an answer) grants nothing. A grant lasts until you log out; `computer_access` with `action: "revoke"` drops them all sooner. GNOME Shell itself (top bar, Activities, the run prompt) is granted the same way, under the name `shell`.
+
+Until an app is granted, its windows are painted black in screen captures (in the Activities overview too), its elements are left out, and clicks or keys that would land on it fail with `APP_NOT_GRANTED`. An action beyond an app's tier fails with `ACCESS_TIER`. The dialog belongs to the shell, and while it is open the extension refuses all input, so the answer is always yours. Window titles and app names stay visible in `computer_list`.
+
+This needs extension API 8, so log out and back in once after updating. An older extension keeps working with no access control, and `computer_list` with `kind: "permissions"` then reports `app_access: off`.
 
 ## The agent cursor
 
@@ -92,6 +112,7 @@ The extension exists because GNOME Shell denies window introspection and screens
 - **Input stays out of your way.** Unless `foreground=true`, a plain click on an element runs its accessibility action without moving the pointer or changing focus, and typing writes into the window's field directly. Key presses, drags, and scrolling in covered windows borrow focus and hand it back.
 - **The Activities overview is closed first.** It covers every window and takes pointer input away from them, so an action that needs input closes it before acting.
 - **A covered window's picture can lag.** Apps stop drawing while nothing shows them, so the screenshot of a covered, minimized or overview-hidden window may be out of date. The observation says so; the element list stays current, so trust it over the picture.
+- **Input is checked where it lands.** The extension looks at the window under the pointer before a button press or scroll, and at the focused window before a key, so a shortcut that switches to an app you did not grant leaves Claude unable to type there.
 - **System dialogs stop input.** While a GNOME dialog (keyring, polkit) or the lock screen holds the keyboard, input tools fail with `SYSTEM_DIALOG_ACTIVE` or `SCREEN_LOCKED` instead of reporting success.
 - **Typing is checked.** When the field can be read, text that did not arrive fails with `INPUT_NOT_DELIVERED`.
 - **Typing follows your keyboard layout.** Characters with no key go through the input method or the clipboard.
@@ -102,7 +123,7 @@ The extension exists because GNOME Shell denies window introspection and screens
 
 ## Error log
 
-Every failed tool call, and any crash of the MCP server, adds one JSON line to `~/.local/state/computer-claude/errors.jsonl` (`$XDG_STATE_HOME` if set): time, plugin version, failing command, error code, message, and details such as a traceback for a bug in the helper. It stays on your machine and nothing is sent anywhere. Typed text, screenshots and tool arguments are never recorded, but a message can name a window or app. The file is private to you (mode 600) and rolls over at about 1 MB. Set `COMPUTER_CLAUDE_NO_ERROR_LOG=1` to turn it off.
+Every failed tool call (a wait that timed out included), any problem the helper worked around without failing the call (text recognition that broke, an observation lost after an action that ran), and any crash of the MCP server adds one JSON line to `~/.local/state/computer-claude/errors.jsonl` (`$XDG_STATE_HOME` if set): time, plugin version, failing command, error code, message, and details such as a traceback for a bug in the helper. It stays on your machine and nothing is sent anywhere. Typed text, screenshots and tool arguments are never recorded, but a message can name a window or app. The file is private to you (mode 600) and rolls over at about 1 MB. Next to it, `timings.jsonl` gets one line per tool call and per helper command with how long it took and whether it worked (`kind`, `name`, `ms`, `ok`), and nothing else, so a slow step can be found later. Set `COMPUTER_CLAUDE_NO_ERROR_LOG=1` to turn both files off.
 
 ```bash
 tail -n 20 ~/.local/state/computer-claude/errors.jsonl
@@ -112,15 +133,16 @@ Arguments the MCP SDK rejects before a tool runs are not logged. Failures inside
 
 ## Trust boundary
 
-Any process on your session bus can call the extension's service, which means it can read the screen and inject input. For callers that must stay inside one window (a remote view of a single window, say), the service also offers `WindowPointer`, `WindowScroll` and `WindowKey`: pointer points are relative to the window and refused unless that exact spot belongs to the window, and keys require the window to have the focus. That is the same trust domain as the desktop session itself; sandboxed (Flatpak) apps cannot reach it unless granted session-bus access. Screenshots are only written inside your runtime directory.
+Any process on your session bus can call the extension's service. It is held to the apps you granted like Claude is: the extension itself checks every screenshot, button press, scroll and key. That limits Claude; it is not a wall against other programs running as you, which have their own ways to read and drive your session (the accessibility bus, for one), and for the same reason the service does not try to tell its callers apart. For callers that must stay inside one window (a remote view of a single window, say), the service also offers `WindowPointer`, `WindowScroll` and `WindowKey`: pointer points are relative to the window and refused unless that exact spot belongs to the window, and keys require the window to have the focus. Those three carry a person's own input to a window they chose, so app grants do not apply to them. That is the same trust domain as the desktop session itself; sandboxed (Flatpak) apps cannot reach it unless granted session-bus access. Screenshots are only written inside your runtime directory.
 
-Claude acts on your real desktop with your permissions. Claude Code asks before each tool call unless you allow the tools; keep it that way for anything you would not hand to someone sitting at your keyboard. To skip the prompt only for tools that look and never act, add this to `permissions.allow` in your Claude Code settings:
+Claude acts on your real desktop with your permissions, inside the apps you granted. Claude Code asks before each tool call unless you allow the tools; keep it that way for anything you would not hand to someone sitting at your keyboard. Allowing `computer_batch` allows every tool it can run. To skip the prompt only for tools that look and never act, add this to `permissions.allow` in your Claude Code settings:
 
 ```json
 [
   "mcp__plugin_computer-claude_computer__computer_list",
   "mcp__plugin_computer-claude_computer__computer_observe",
   "mcp__plugin_computer-claude_computer__computer_inspect",
+  "mcp__plugin_computer-claude_computer__computer_frames",
   "mcp__plugin_computer-claude_computer__computer_wait",
   "mcp__plugin_computer-claude_computer__computer_zoom"
 ]
@@ -132,8 +154,13 @@ Claude acts on your real desktop with your permissions. Claude Code asks before 
 npm install
 npm run typecheck
 npm run lint
+npm test
 npm run build
 ```
+
+`npm test` covers the MCP tool layer against a fake helper and the helper's own logic; neither needs a desktop.
+
+The server keeps one helper process (`computer-claude-desktop serve`) for as long as it runs and sends it one command per line, which saves about 150 ms of Python startup on every command. A command that is cancelled or times out ends that process, and the next command starts a new one. Run alone, the helper still takes one command from its arguments.
 
 Try a checkout without installing it: `claude --plugin-dir .`
 

@@ -13,6 +13,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "lint": "biome check .",
+    "test": "node scripts/test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
